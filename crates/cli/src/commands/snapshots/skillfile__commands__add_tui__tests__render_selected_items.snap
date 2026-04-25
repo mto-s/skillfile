@@ -1,14 +1,14 @@
 ---
 source: crates/cli/src/commands/add_tui.rs
-expression: buffer_text(terminal.backend().buffer())
+expression: "render_to_text(|f| draw(f, &mut app))"
 ---
- Space toggle  a all  Tab scroll  Enter confirm  Esc cancel  ✓ 2 selected  5/5
+ Space toggle  a all  Tab scroll  Enter confirm  Esc cancel  type to filter  ✓ 2
 ┌ owner/repo ──────────────────┐┌ Preview ↑↓Tab ───────────────────────────────┐
-│▶ ◉ browser  📁   skills/      ││skills/browser                                │
-│  ○ code-review  📁   skills/  ││                                              │
-│  ◉ commit  📁   skills/       ││○ Loading preview...                          │
+│▶ ◉ 📁  browser  skills/       ││skills/browser                                │
+│  ○ 📁  code-review  skills/   ││                                              │
+│  ◉ 📁  commit  skills/        ││○ Loading preview...                          │
 │  ○ SKILL.md  skills/debugging││                                              │
-│  ○ testing  📁   skills/      ││                                              │
+│  ○ 📁  testing  skills/       ││                                              │
 │                              ││                                              │
 │                              ││                                              │
 │                              ││                                              │
