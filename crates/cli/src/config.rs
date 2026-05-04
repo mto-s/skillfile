@@ -32,6 +32,8 @@ use skillfile_core::error::SkillfileError;
 use skillfile_core::models::{InstallTarget, Manifest, Scope};
 use skillfile_core::parser::parse_manifest;
 
+const CONFIG_PATH_OVERRIDE_ENV: &str = "SKILLFILE_CONFIG_PATH";
+
 // ---------------------------------------------------------------------------
 // TOML schema
 // ---------------------------------------------------------------------------
@@ -89,7 +91,14 @@ impl InstallEntry {
 ///
 /// Returns `None` if the platform has no config directory.
 pub fn config_path() -> Option<PathBuf> {
+    if let Some(path) = config_path_override(std::env::var_os(CONFIG_PATH_OVERRIDE_ENV)) {
+        return Some(path);
+    }
     dirs::config_dir().map(|d| d.join("skillfile").join("config.toml"))
+}
+
+fn config_path_override(path: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    path.filter(|p| !p.is_empty()).map(PathBuf::from)
 }
 
 /// Read install targets from a TOML config file at the given path.
@@ -115,6 +124,10 @@ pub fn read_user_targets_from(path: &Path) -> Vec<InstallTarget> {
 /// Returns an empty `Vec` if no config directory exists, the file is missing,
 /// or it contains no valid entries.
 pub fn read_user_targets() -> Vec<InstallTarget> {
+    #[cfg(test)]
+    if std::env::var_os(CONFIG_PATH_OVERRIDE_ENV).is_none() {
+        return Vec::new();
+    }
     match config_path() {
         Some(path) => read_user_targets_from(&path),
         None => Vec::new(),
@@ -227,6 +240,17 @@ mod tests {
             assert!(path.ends_with("skillfile/config.toml"));
         }
         // On platforms without config_dir, returns None — that's fine.
+    }
+
+    #[test]
+    fn config_path_override_uses_explicit_file_path() {
+        let path = config_path_override(Some("/tmp/skillfile-config.toml".into()));
+        assert_eq!(path, Some(PathBuf::from("/tmp/skillfile-config.toml")));
+    }
+
+    #[test]
+    fn config_path_override_ignores_empty_value() {
+        assert_eq!(config_path_override(Some("".into())), None);
     }
 
     #[test]

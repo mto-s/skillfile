@@ -12,6 +12,30 @@ fn normalize_separators(text: &str) -> String {
     text.replace('\\', "/")
 }
 
+#[cfg(unix)]
+fn write_fake_gh(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let gh = dir.join("gh");
+    std::fs::write(&gh, "#!/bin/sh\nexit 1\n").unwrap();
+    let perms = std::fs::Permissions::from_mode(0o755);
+    std::fs::set_permissions(&gh, perms).unwrap();
+}
+
+#[cfg(windows)]
+fn write_fake_gh(dir: &Path) {
+    std::fs::write(dir.join("gh.cmd"), "@echo off\r\nexit /b 1\r\n").unwrap();
+}
+
+fn fake_gh_path(root: &Path) -> std::ffi::OsString {
+    let bin_dir = root.join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    write_fake_gh(&bin_dir);
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let paths = std::iter::once(bin_dir).chain(std::env::split_paths(&current));
+    std::env::join_paths(paths).unwrap()
+}
+
 // ---------------------------------------------------------------------------
 // Smoke tests (binary boots up)
 // ---------------------------------------------------------------------------
@@ -33,7 +57,7 @@ fn version_flag_exits_zero() {
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("skillfile"));
+        .stdout(predicate::str::starts_with("skillfile "));
 }
 
 #[test]
@@ -42,6 +66,24 @@ fn no_args_exits_nonzero() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("Usage"));
+}
+
+#[test]
+fn github_auth_test_detects_config_file_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    std::fs::write(&config_path, "github_token = \"ghp_from_config\"\n").unwrap();
+
+    sf(dir.path())
+        .arg("__github-auth-test")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("GH_TOKEN")
+        .env("SKILLFILE_CONFIG_PATH", &config_path)
+        .env("PATH", fake_gh_path(dir.path()))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("available"));
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +180,61 @@ fn validate_error_output_is_plain_text_when_captured() {
 }
 
 #[test]
+fn validate_parse_warnings_fail_as_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Skillfile"), "svn  skill  bad\n").unwrap();
+
+    let output = sf(dir.path()).arg("validate").output().unwrap();
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+
+    assert!(
+        !output.status.success(),
+        "validate should fail for malformed manifest lines"
+    );
+    assert_eq!(stdout, "", "error path should not write to stdout");
+    assert!(
+        stderr.contains("error: line 1: unknown source type 'svn', skipping"),
+        "unexpected validate stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("\u{1b}["),
+        "captured validate stderr should stay plain text: {stderr:?}"
+    );
+}
+
+#[test]
+fn validate_duplicate_name_reported_once() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("skills")).unwrap();
+    std::fs::write(dir.path().join("skills/a.md"), "# A\n").unwrap();
+    std::fs::write(dir.path().join("skills/b.md"), "# B\n").unwrap();
+    std::fs::write(
+        dir.path().join("Skillfile"),
+        "local  skill  dup  skills/a.md\n\
+         local  skill  dup  skills/b.md\n",
+    )
+    .unwrap();
+
+    let output = sf(dir.path()).arg("validate").output().unwrap();
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+
+    assert!(
+        !output.status.success(),
+        "validate should fail on duplicate names"
+    );
+    assert_eq!(
+        stderr.matches("duplicate").count(),
+        1,
+        "duplicate name should be reported once, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("error: duplicate name 'dup'"),
+        "unexpected validate stderr:\n{stderr}"
+    );
+}
+
+#[test]
 fn status_output_is_plain_text_when_captured() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -199,14 +296,19 @@ fn format_golden_path() {
 #[test]
 fn add_then_remove() {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("skills")).unwrap();
+    std::fs::write(dir.path().join("skills/test.md"), "# Test Skill\n").unwrap();
     std::fs::write(dir.path().join("Skillfile"), "# empty\n").unwrap();
 
     sf(dir.path())
+        .env(
+            "SKILLFILE_CONFIG_PATH",
+            dir.path().join("missing-config.toml"),
+        )
         .args([
             "add",
-            "github",
+            "local",
             "skill",
-            "owner/repo",
             "skills/test.md",
             "--name",
             "my-new-skill",
@@ -287,6 +389,126 @@ fn write_multi_target_skill_fixture(dir: &Path, name: &str) {
         )
         .unwrap();
     }
+}
+
+struct RemoteSkillFixture<'a> {
+    name: &'a str,
+    installed_text: Option<&'a str>,
+    patch_text: Option<&'a str>,
+}
+
+fn write_remote_skill_fixture(dir: &Path, fixture: &RemoteSkillFixture<'_>) {
+    let RemoteSkillFixture {
+        name,
+        installed_text,
+        patch_text,
+    } = fixture;
+    let manifest = format!(
+        "install  claude-code  local\n\
+         github  skill  {name}  owner/repo  skills/{name}.md  main\n"
+    );
+    std::fs::write(dir.join("Skillfile"), manifest).unwrap();
+
+    let lock_json = serde_json::json!({
+        format!("github/skill/{name}"): {
+            "sha": "abc123def456abc123def456abc123def456abc1",
+            "raw_url": format!("https://raw.githubusercontent.com/owner/repo/abc123/skills/{name}.md")
+        }
+    });
+    std::fs::write(
+        dir.join("Skillfile.lock"),
+        serde_json::to_string_pretty(&lock_json).unwrap(),
+    )
+    .unwrap();
+
+    let vdir = dir.join(format!(".skillfile/cache/skills/{name}"));
+    std::fs::create_dir_all(&vdir).unwrap();
+    std::fs::write(
+        vdir.join(format!("{name}.md")),
+        "# Skill\n\nUpstream content.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        vdir.join(".meta"),
+        r#"{"sha":"abc123def456abc123def456abc123def456abc1"}"#,
+    )
+    .unwrap();
+
+    if let Some(text) = installed_text {
+        let installed_dir = dir.join(".claude/skills").join(name);
+        std::fs::create_dir_all(&installed_dir).unwrap();
+        std::fs::write(installed_dir.join("SKILL.md"), text).unwrap();
+    }
+
+    if let Some(text) = patch_text {
+        let patch_dir = dir.join(".skillfile/patches/skills");
+        std::fs::create_dir_all(&patch_dir).unwrap();
+        std::fs::write(patch_dir.join(format!("{name}.patch")), text).unwrap();
+    }
+}
+
+fn write_info_lock_pin_cache_fixture(dir: &Path) {
+    write_remote_skill_fixture(
+        dir,
+        &RemoteSkillFixture {
+            name: "info-skill",
+            installed_text: Some(
+                "# Skill\n\nUpstream content.\n\n## Custom Section\n\nAdded by user.\n",
+            ),
+            patch_text: Some(
+                "--- a/info-skill.md\n+++ b/info-skill.md\n@@ -1,3 +1,7 @@\n # Skill\n \n Upstream content.\n+\n+## Custom Section\n+\n+Added by user.\n",
+            ),
+        },
+    );
+}
+
+fn output_line<'a>(stdout: &'a str, label: &str) -> &'a str {
+    stdout
+        .lines()
+        .find(|line| line.contains(label))
+        .unwrap_or_else(|| panic!("missing {label} line:\n{stdout}"))
+}
+
+fn assert_output_contains(stdout: &str, label: &str, value: &str) {
+    let line = output_line(stdout, label);
+    assert!(
+        line.contains(value),
+        "{label} line missing {value}:\n{stdout}"
+    );
+}
+
+fn assert_info_lock_pin_cache_output(stdout: &str) {
+    let stdout = normalize_separators(stdout);
+
+    assert_output_contains(&stdout, "Name:", "info-skill");
+    assert_output_contains(&stdout, "Type:", "skill");
+    assert_output_contains(&stdout, "Source:", "github (owner/repo)");
+    assert_output_contains(&stdout, "Path:", "skills/info-skill.md");
+    assert_output_contains(&stdout, "Ref:", "main");
+    assert_output_contains(&stdout, "Locked:", "abc123d");
+    assert_output_contains(
+        &stdout,
+        "Pinned:",
+        ".skillfile/patches/skills/info-skill.patch",
+    );
+    assert_output_contains(&stdout, "Installed:", ".claude/skills/info-skill/SKILL.md");
+    assert_output_contains(
+        &stdout,
+        "Cache:",
+        ".skillfile/cache/skills/info-skill/info-skill.md",
+    );
+
+    let installed_line = output_line(&stdout, "Installed:");
+    assert!(
+        !installed_line.contains("(not installed)"),
+        "info output must show the installed path as present:\n{stdout}"
+    );
+
+    let modified_line = output_line(&stdout, "Modified:");
+    assert!(
+        modified_line.trim_end().ends_with("no"),
+        "pinned fixture should report modified=no:\n{stdout}"
+    );
 }
 
 #[test]
@@ -372,18 +594,35 @@ fn add_github_normal_path_no_bulk() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("Skillfile"), "# empty\n").unwrap();
 
-    // This will fail at sync (no network), but should NOT try to discover.
+    // With no install targets configured, direct add returns early after
+    // appending the entry. Bulk discovery would fail before printing this.
     let output = sf(dir.path())
+        .env(
+            "SKILLFILE_CONFIG_PATH",
+            dir.path().join("missing-config.toml"),
+        )
         .args(["add", "github", "skill", "owner/repo", "skills/SKILL.md"])
         .timeout(std::time::Duration::from_secs(10))
         .output()
         .expect("failed to execute");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Normal add prints "Added: github  skill  ..." before attempting sync.
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains("Added:"),
-        "normal add path should print 'Added:' line, got: {stdout}"
+        output.status.success(),
+        "normal add path should succeed without install targets: {stderr}"
+    );
+    assert!(
+        stdout.contains("Added: github  skill  owner/repo  skills/SKILL.md"),
+        "normal add path should print the added entry, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("No install targets configured yet"),
+        "normal add path should take the direct add path, got: {stdout}"
+    );
+    assert!(
+        !stderr.contains("no skills found under"),
+        "normal add path must not route into bulk discovery, got: {stderr}"
     );
 }
 
@@ -440,6 +679,10 @@ fn add_prints_no_targets_message_when_none_configured() {
     std::fs::write(dir.path().join("Skillfile"), "# empty\n").unwrap();
 
     let output = sf(dir.path())
+        .env(
+            "SKILLFILE_CONFIG_PATH",
+            dir.path().join("missing-config.toml"),
+        )
         .args(["add", "local", "skill", "skills/test.md"])
         .timeout(std::time::Duration::from_secs(5))
         .output()
@@ -453,6 +696,423 @@ fn add_prints_no_targets_message_when_none_configured() {
     assert!(
         stdout.contains("skillfile init"),
         "should point to `skillfile init`, got: {stdout}"
+    );
+}
+
+#[test]
+fn add_uses_config_backed_install_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("skills")).unwrap();
+    std::fs::write(dir.path().join("skills/test.md"), "# Test Skill\n").unwrap();
+    std::fs::write(dir.path().join("Skillfile"), "# empty\n").unwrap();
+
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        "[[install]]\nplatform = \"claude-code\"\nscope = \"local\"\n",
+    )
+    .unwrap();
+
+    let output = sf(dir.path())
+        .env("SKILLFILE_CONFIG_PATH", &config_path)
+        .args(["add", "local", "skill", "skills/test.md"])
+        .timeout(std::time::Duration::from_secs(5))
+        .output()
+        .expect("failed to execute");
+
+    assert!(
+        output.status.success(),
+        "add should succeed with config-backed targets: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Installed to: claude-code (local)"),
+        "config-backed targets should be used for install, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("No install targets configured yet"),
+        "config-backed targets must suppress the no-targets message, got: {stdout}"
+    );
+    assert!(
+        dir.path().join(".claude/skills/test/SKILL.md").exists(),
+        "add should install into the config-backed target"
+    );
+
+    let skillfile = std::fs::read_to_string(dir.path().join("Skillfile")).unwrap();
+    assert!(
+        skillfile.contains("local  skill  skills/test.md"),
+        "add should still persist the entry in Skillfile"
+    );
+}
+
+#[test]
+fn add_reports_only_targets_that_were_updated() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("agents")).unwrap();
+    std::fs::write(dir.path().join("agents/test.md"), "# Test Agent\n").unwrap();
+    std::fs::write(
+        dir.path().join("Skillfile"),
+        "install  claude-code  local\n\
+         install  codex  local\n",
+    )
+    .unwrap();
+
+    let output = sf(dir.path())
+        .args(["add", "local", "agent", "agents/test.md"])
+        .timeout(std::time::Duration::from_secs(5))
+        .output()
+        .expect("failed to execute");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Installed to: claude-code (local)"),
+        "should report the supported target, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Skipped: codex (local) [unsupported agent]"),
+        "should report skipped unsupported targets, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Installed to: claude-code (local), codex (local)"),
+        "must not claim unsupported targets were installed, got: {stdout}"
+    );
+    assert!(
+        !dir.path().join(".skillfile/tmp").exists(),
+        "successful add should not leave repo-local transaction scratch dirs behind"
+    );
+}
+
+#[test]
+fn add_reports_when_no_configured_platforms_were_updated() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("agents")).unwrap();
+    std::fs::write(dir.path().join("agents/test.md"), "# Test Agent\n").unwrap();
+    std::fs::write(dir.path().join("Skillfile"), "install  codex  local\n").unwrap();
+
+    let output = sf(dir.path())
+        .args(["add", "local", "agent", "agents/test.md"])
+        .timeout(std::time::Duration::from_secs(5))
+        .output()
+        .expect("failed to execute");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("No configured platforms were updated."),
+        "should report that all configured targets were skipped, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Skipped: codex (local) [unsupported agent]"),
+        "should explain why nothing was updated, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Installed to:"),
+        "must not print an install-success summary when nothing was updated, got: {stdout}"
+    );
+}
+
+#[test]
+fn add_missing_source_does_not_claim_install_success() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Skillfile"),
+        "install  claude-code  local\n",
+    )
+    .unwrap();
+
+    let output = sf(dir.path())
+        .args(["add", "local", "skill", "skills/missing.md"])
+        .timeout(std::time::Duration::from_secs(5))
+        .output()
+        .expect("failed to execute");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("No configured platforms were updated."),
+        "should not report install success when the source is missing, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("Skipped: claude-code (local) [source missing]"),
+        "should summarize the skipped target, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Installed to:"),
+        "must not claim install success for a missing source, got: {stdout}"
+    );
+    assert!(
+        stderr.contains("warning: source missing"),
+        "missing source warning should still be emitted, got: {stderr}"
+    );
+}
+
+#[test]
+fn add_rolls_back_when_install_target_path_is_blocked() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("skills")).unwrap();
+    std::fs::write(dir.path().join("skills/test.md"), "# Test Skill\n").unwrap();
+    std::fs::write(
+        dir.path().join("Skillfile"),
+        "install  claude-code  local\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join(".claude"), "not a directory\n").unwrap();
+
+    let output = sf(dir.path())
+        .args(["add", "local", "skill", "skills/test.md"])
+        .timeout(std::time::Duration::from_secs(5))
+        .output()
+        .expect("failed to execute");
+
+    assert!(
+        !output.status.success(),
+        "command should fail when install target is blocked"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stdout.contains("Added:"),
+        "failed add must not print a success banner, got: {stdout}"
+    );
+    assert!(
+        stderr.contains("Rolled back: removed 'test' from Skillfile"),
+        "rollback message should be emitted, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("failed to install 'test' to claude-code (local)"),
+        "install failure should be surfaced, got: {stderr}"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("Skillfile")).unwrap(),
+        "install  claude-code  local\n"
+    );
+    assert!(
+        !dir.path().join("Skillfile.lock").exists(),
+        "lock file should be removed on rollback"
+    );
+    assert!(
+        !dir.path().join(".skillfile/cache/skills/test").exists(),
+        "cache dir should be removed on rollback"
+    );
+    assert!(
+        !dir.path().join(".skillfile/tmp").exists(),
+        "rollback should not leave repo-local transaction scratch dirs behind"
+    );
+}
+
+#[test]
+fn add_removes_earlier_platform_files_when_later_target_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("skills")).unwrap();
+    std::fs::write(dir.path().join("skills/test.md"), "# Test Skill\n").unwrap();
+    std::fs::write(
+        dir.path().join("Skillfile"),
+        "install  claude-code  local\n\
+         install  cursor  local\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join(".cursor"), "not a directory\n").unwrap();
+
+    let output = sf(dir.path())
+        .args(["add", "local", "skill", "skills/test.md"])
+        .timeout(std::time::Duration::from_secs(5))
+        .output()
+        .expect("failed to execute");
+
+    assert!(
+        !output.status.success(),
+        "command should fail when a later target is blocked"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stdout.contains("Added:"),
+        "rolled-back add must not print a success banner, got: {stdout}"
+    );
+    assert!(
+        stderr.contains("Rolled back: removed 'test' from Skillfile"),
+        "rollback should still be announced, got: {stderr}"
+    );
+    assert!(
+        !dir.path().join(".claude/skills/test/SKILL.md").exists(),
+        "files written to earlier targets must be removed on rollback"
+    );
+    assert!(
+        !dir.path().join(".skillfile/tmp").exists(),
+        "rolled-back add should not leave repo-local transaction scratch dirs behind"
+    );
+}
+
+#[test]
+fn add_restores_legacy_flat_file_when_later_target_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("skills")).unwrap();
+    std::fs::create_dir_all(dir.path().join(".claude/skills")).unwrap();
+    std::fs::write(dir.path().join("skills/foo.md"), "# New Foo\n").unwrap();
+    std::fs::write(dir.path().join(".claude/skills/foo.md"), "# Legacy Foo\n").unwrap();
+    std::fs::write(
+        dir.path().join("Skillfile"),
+        "install  claude-code  local\n\
+         install  copilot  local\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join(".github"), "not a directory\n").unwrap();
+
+    let output = sf(dir.path())
+        .args(["add", "local", "skill", "skills/foo.md", "--name", "foo"])
+        .timeout(std::time::Duration::from_secs(5))
+        .output()
+        .expect("failed to execute");
+
+    assert!(
+        !output.status.success(),
+        "command should fail when a later target is blocked"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Rolled back: removed 'foo' from Skillfile"),
+        "rollback should be announced, got: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(".claude/skills/foo.md")).unwrap(),
+        "# Legacy Foo\n",
+        "rollback must restore adapter migration side effects"
+    );
+    assert!(
+        !dir.path().join(".claude/skills/foo/SKILL.md").exists(),
+        "new nested install must be removed on rollback"
+    );
+}
+
+#[test]
+fn install_fails_when_nested_target_path_is_blocked_without_update() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("skills")).unwrap();
+    std::fs::write(dir.path().join("skills/test.md"), "# Test Skill\n").unwrap();
+    std::fs::write(
+        dir.path().join("Skillfile"),
+        "install  claude-code  local\n\
+         local  skill  test  skills/test.md\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join(".claude"), "not a directory\n").unwrap();
+
+    let output = sf(dir.path())
+        .arg("install")
+        .timeout(std::time::Duration::from_secs(5))
+        .output()
+        .expect("failed to execute");
+
+    assert!(
+        !output.status.success(),
+        "default install should fail when the target path is blocked"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed to install 'test' to claude-code (local)"),
+        "install failure should be surfaced, got: {stderr}"
+    );
+    assert!(
+        !stdout.contains("Done."),
+        "failed install must not report success, got: {stdout}"
+    );
+    assert!(
+        !dir.path().join(".claude/skills/test/SKILL.md").exists(),
+        "blocked install must not leave a deployed file behind"
+    );
+}
+
+#[test]
+fn install_cleans_up_partial_flat_write_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agents/core-dev");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(agent_dir.join("alpha.md"), "# Alpha\n").unwrap();
+    std::fs::write(agent_dir.join("beta.md"), "# Beta\n").unwrap();
+    std::fs::write(
+        dir.path().join("Skillfile"),
+        "install  claude-code  local\n\
+         local  agent  core-dev  agents/core-dev\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join(".claude/agents/alpha.md")).unwrap();
+
+    let output = sf(dir.path())
+        .arg("install")
+        .timeout(std::time::Duration::from_secs(5))
+        .output()
+        .expect("failed to execute");
+
+    assert!(
+        !output.status.success(),
+        "install should fail when only part of a flat directory can be deployed"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed to install 'core-dev' to claude-code (local)"),
+        "partial flat failure should be surfaced, got: {stderr}"
+    );
+    assert!(
+        dir.path().join(".claude/agents/alpha.md").is_dir(),
+        "the pre-existing blocking path should remain untouched"
+    );
+    assert!(
+        !dir.path().join(".claude/agents/beta.md").exists(),
+        "newly written files must be cleaned up after partial failure"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn install_update_restores_existing_nested_dir_when_copy_fails() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source_dir = dir.path().join("skills/foo");
+    let dest_dir = dir.path().join(".claude/skills/foo");
+    std::fs::create_dir_all(&source_dir).unwrap();
+    std::fs::create_dir_all(&dest_dir).unwrap();
+    std::fs::write(source_dir.join("SKILL.md"), "# New Foo\n").unwrap();
+    symlink("missing-target.md", source_dir.join("dangling.md")).unwrap();
+    std::fs::write(dest_dir.join("SKILL.md"), "# Old Foo\n").unwrap();
+    std::fs::write(dest_dir.join("keep.md"), "# Keep\n").unwrap();
+    std::fs::write(
+        dir.path().join("Skillfile"),
+        "install  claude-code  local\n\
+         local  skill  foo  skills/foo\n",
+    )
+    .unwrap();
+
+    let output = sf(dir.path())
+        .args(["install", "--update"])
+        .timeout(std::time::Duration::from_secs(5))
+        .output()
+        .expect("failed to execute");
+
+    assert!(
+        !output.status.success(),
+        "install --update should fail when source copy fails"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed to install 'foo' to claude-code (local)"),
+        "install failure should be surfaced, got: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dest_dir.join("SKILL.md")).unwrap(),
+        "# Old Foo\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dest_dir.join("keep.md")).unwrap(),
+        "# Keep\n"
     );
 }
 
@@ -547,6 +1207,46 @@ fn info_shows_missing_secondary_target() {
 }
 
 #[test]
+fn info_shows_lock_pin_and_cache_details() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_info_lock_pin_cache_fixture(root);
+
+    let output = sf(root).args(["info", "info-skill"]).output().unwrap();
+
+    assert!(output.status.success());
+    assert_info_lock_pin_cache_output(std::str::from_utf8(&output.stdout).unwrap());
+}
+
+#[test]
+fn info_reports_modified_when_pinned_entry_has_extra_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_info_lock_pin_cache_fixture(root);
+
+    let installed = root.join(".claude/skills/info-skill/SKILL.md");
+    std::fs::write(
+        &installed,
+        "# Skill\n\nUpstream content.\n\n## Custom Section\n\nAdded by user.\nExtra drift.\n",
+    )
+    .unwrap();
+
+    let output = sf(root).args(["info", "info-skill"]).output().unwrap();
+
+    assert!(output.status.success());
+
+    let stdout = normalize_separators(std::str::from_utf8(&output.stdout).unwrap());
+    let modified_line = stdout
+        .lines()
+        .find(|line| line.contains("Modified:"))
+        .unwrap();
+    assert!(
+        modified_line.trim_end().ends_with("yes"),
+        "info should report pinned extra edits as modified:\n{stdout}"
+    );
+}
+
+#[test]
 fn info_shows_flat_dir_installed_files() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
@@ -573,6 +1273,34 @@ fn info_shows_flat_dir_installed_files() {
     assert!(stdout.contains(".claude/agents/agent.md"));
     assert!(stdout.contains(".claude/agents/notes.md"));
     assert!(!stdout.contains("(not installed)"));
+}
+
+#[test]
+fn status_reports_remote_entry_as_not_installed_when_files_are_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_remote_skill_fixture(
+        root,
+        &RemoteSkillFixture {
+            name: "remote-skill",
+            installed_text: None,
+            patch_text: None,
+        },
+    );
+
+    let output = sf(root).arg("status").output().unwrap();
+
+    assert!(output.status.success());
+
+    let stdout = normalize_separators(std::str::from_utf8(&output.stdout).unwrap());
+    assert!(
+        stdout.contains("remote-skill"),
+        "status output must include the entry name:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("[not installed]"),
+        "status must surface missing installs for locked remote entries:\n{stdout}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -765,4 +1493,32 @@ fn resolve_abort_clears_conflict() {
         !conflict_dir.join("conflict").exists(),
         "conflict file should be cleared after --abort"
     );
+}
+
+// ---------------------------------------------------------------------------
+// upgrade
+// ---------------------------------------------------------------------------
+
+/// `skillfile upgrade` is a thin wrapper for `install --update`.
+/// With a local-only Skillfile and no network, it should succeed and behave
+/// identically to `skillfile install --update`.
+#[test]
+fn upgrade_succeeds_on_local_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    write_local_manifest(dir.path());
+
+    sf(dir.path()).arg("upgrade").assert().success();
+}
+
+/// `skillfile upgrade --dry-run` should exit zero and mention the dry-run
+/// behaviour without modifying any files.
+#[test]
+fn upgrade_dry_run_exits_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    write_local_manifest(dir.path());
+
+    sf(dir.path())
+        .args(["upgrade", "--dry-run"])
+        .assert()
+        .success();
 }
