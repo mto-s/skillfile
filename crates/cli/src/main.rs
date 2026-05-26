@@ -489,6 +489,24 @@ enum AddSource {
         #[arg(long)]
         no_interactive: bool,
     },
+    /// Add a GitLab-hosted entry
+    Gitlab {
+        /// Entity type: skill or agent
+        #[arg(value_name = "TYPE", value_parser = parse_entity_type)]
+        entity_type: String,
+        /// GitLab project path (e.g. group/project or group/subgroup/project)
+        #[arg(value_name = "PROJECT")]
+        owner_repo: String,
+        /// Path within the repo
+        #[arg(value_name = "PATH")]
+        path: Option<String>,
+        /// Branch, tag, or SHA (default: main)
+        #[arg(value_name = "REF")]
+        ref_: Option<String>,
+        /// Override name (default: filename stem)
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+    },
     /// Add a local file entry
     Local {
         /// Entity type: skill or agent
@@ -524,6 +542,53 @@ fn is_discovery_path(path: &str) -> bool {
             .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
 }
 
+type AddEntryParts<'a> = (&'a str, &'a str, &'a str, Option<&'a str>, Option<&'a str>);
+type BulkAddParts<'a> = (&'a str, &'a str, &'a str, Option<&'a str>, bool);
+
+fn github_entry_from_parts(
+    (entity_type, owner_repo, path, ref_, name): AddEntryParts<'_>,
+) -> skillfile_core::models::Entry {
+    let (parsed_repo, parsed_ref) = parse_owner_repo_ref(owner_repo);
+    let effective_ref = resolve_owner_repo_ref(parsed_ref, ref_);
+    commands::add::entry_from_github(&commands::add::GithubEntryArgs {
+        entity_type,
+        owner_repo: &parsed_repo,
+        path,
+        ref_: Some(effective_ref.as_str()),
+        name,
+    })
+}
+
+fn gitlab_entry_from_parts(
+    (entity_type, owner_repo, path, ref_, name): AddEntryParts<'_>,
+) -> skillfile_core::models::Entry {
+    commands::add::entry_from_gitlab(&commands::add::GitlabEntryArgs {
+        entity_type,
+        owner_repo,
+        path,
+        ref_,
+        name,
+    })
+}
+
+fn add_github_bulk(
+    (entity_type, owner_repo, base_path, ref_, no_interactive): BulkAddParts<'_>,
+    repo_root: &std::path::Path,
+) -> Result<(), SkillfileError> {
+    let (parsed_repo, parsed_ref) = parse_owner_repo_ref(owner_repo);
+    let explicit_ref = resolve_explicit_owner_repo_ref(parsed_ref, ref_);
+    commands::add::cmd_add_bulk(
+        &commands::add::BulkAddArgs {
+            entity_type,
+            owner_repo: &parsed_repo,
+            base_path,
+            ref_: explicit_ref.as_deref(),
+            no_interactive,
+        },
+        repo_root,
+    )
+}
+
 fn handle_add(source: AddSource, repo_root: &std::path::Path) -> Result<(), SkillfileError> {
     let entry = match source {
         AddSource::Github {
@@ -534,17 +599,14 @@ fn handle_add(source: AddSource, repo_root: &std::path::Path) -> Result<(), Skil
             name: _,
             no_interactive,
         } if is_discovery_path(path.as_deref().unwrap_or(".")) => {
-            let base_path = path.as_deref().unwrap_or(".");
-            let (parsed_repo, parsed_ref) = parse_owner_repo_ref(&owner_repo);
-            let explicit_ref = resolve_explicit_owner_repo_ref(parsed_ref, ref_.as_deref());
-            return commands::add::cmd_add_bulk(
-                &commands::add::BulkAddArgs {
-                    entity_type: &entity_type,
-                    owner_repo: &parsed_repo,
-                    base_path,
-                    ref_: explicit_ref.as_deref(),
+            return add_github_bulk(
+                (
+                    &entity_type,
+                    &owner_repo,
+                    path.as_deref().unwrap_or("."),
+                    ref_.as_deref(),
                     no_interactive,
-                },
+                ),
                 repo_root,
             );
         }
@@ -555,17 +617,26 @@ fn handle_add(source: AddSource, repo_root: &std::path::Path) -> Result<(), Skil
             ref_,
             name,
             no_interactive: _,
-        } => {
-            let (parsed_repo, parsed_ref) = parse_owner_repo_ref(&owner_repo);
-            let effective_ref = resolve_owner_repo_ref(parsed_ref, ref_.as_deref());
-            commands::add::entry_from_github(&commands::add::GithubEntryArgs {
-                entity_type: &entity_type,
-                owner_repo: &parsed_repo,
-                path: path.as_deref().unwrap_or("."),
-                ref_: Some(effective_ref.as_str()),
-                name: name.as_deref(),
-            })
-        }
+        } => github_entry_from_parts((
+            &entity_type,
+            &owner_repo,
+            path.as_deref().unwrap_or("."),
+            ref_.as_deref(),
+            name.as_deref(),
+        )),
+        AddSource::Gitlab {
+            entity_type,
+            owner_repo,
+            path,
+            ref_,
+            name,
+        } => gitlab_entry_from_parts((
+            &entity_type,
+            &owner_repo,
+            path.as_deref().unwrap_or("."),
+            ref_.as_deref(),
+            name.as_deref(),
+        )),
         AddSource::Local {
             entity_type,
             path,
@@ -702,6 +773,8 @@ fn run() -> Result<(), SkillfileError> {
     // Inject config-file token before any command (and before the OnceLock is
     // populated by `github_token()`). This runs once; subsequent calls are no-ops.
     skillfile_sources::http::set_config_token(crate::config::read_config_token());
+    skillfile_sources::http::set_gitlab_config_token(crate::config::read_gitlab_config_token());
+    skillfile_sources::http::set_gitlab_config_host(crate::config::read_gitlab_config_host());
 
     let cli = match cli_command().try_get_matches() {
         Ok(matches) => Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit()),
