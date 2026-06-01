@@ -17,11 +17,34 @@ use crate::strategy::{content_file, is_dir_entry, meta_sha};
 
 pub const VENDOR_DIR: &str = ".skillfile/cache";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ForgeType {
+    Github,
+    Gitlab,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RemoteRefKey {
+    forge: ForgeType,
+    owner_repo: String,
+    ref_: String,
+}
+
+impl RemoteRefKey {
+    fn new(forge: ForgeType, owner_repo: &str, ref_: &str) -> Self {
+        Self {
+            forge,
+            owner_repo: owner_repo.to_owned(),
+            ref_: ref_.to_owned(),
+        }
+    }
+}
+
 pub struct SyncContext {
     pub repo_root: PathBuf,
     pub dry_run: bool,
     pub update: bool,
-    pub sha_cache: HashMap<(String, String), String>,
+    pub sha_cache: HashMap<RemoteRefKey, String>,
     pub locked: BTreeMap<String, LockEntry>,
 }
 
@@ -62,27 +85,23 @@ fn content_exists(entry: &Entry, vdir: &Path) -> bool {
     }
 }
 
-fn cache_github_sha(ctx: &mut SyncContext, entry: &Entry, sha: &str) {
-    let SourceFields::Github {
-        owner_repo, ref_, ..
-    } = &entry.source
-    else {
-        return;
-    };
-    let cache_key = (owner_repo.clone(), ref_.clone());
-    ctx.sha_cache
-        .entry(cache_key)
-        .or_insert_with(|| sha.to_owned());
+fn remote_repo_ref(entry: &Entry) -> Option<(&str, &str, ForgeType)> {
+    match &entry.source {
+        SourceFields::Github {
+            owner_repo, ref_, ..
+        } => Some((owner_repo, ref_, ForgeType::Github)),
+        SourceFields::Gitlab {
+            owner_repo, ref_, ..
+        } => Some((owner_repo, ref_, ForgeType::Gitlab)),
+        _ => None,
+    }
 }
 
-fn cache_gitlab_sha(ctx: &mut SyncContext, entry: &Entry, sha: &str) {
-    let SourceFields::Gitlab {
-        owner_repo, ref_, ..
-    } = &entry.source
-    else {
+fn cache_remote_sha(ctx: &mut SyncContext, entry: &Entry, sha: &str) {
+    let Some((owner_repo, ref_, forge)) = remote_repo_ref(entry) else {
         return;
     };
-    let cache_key = (owner_repo.clone(), ref_.clone());
+    let cache_key = RemoteRefKey::new(forge, owner_repo, ref_);
     ctx.sha_cache
         .entry(cache_key)
         .or_insert_with(|| sha.to_owned());
@@ -108,7 +127,7 @@ pub fn sync_entry(
                 locked: &ctx.locked,
             };
             if let Some((key, le)) = sync_github_core(client, entry, &params)? {
-                cache_github_sha(ctx, entry, &le.sha);
+                cache_remote_sha(ctx, entry, &le.sha);
                 ctx.locked.insert(key, le);
             }
             Ok(())
@@ -122,7 +141,7 @@ pub fn sync_entry(
                 locked: &ctx.locked,
             };
             if let Some((key, le)) = sync_gitlab_core(client, entry, &params)? {
-                cache_gitlab_sha(ctx, entry, &le.sha);
+                cache_remote_sha(ctx, entry, &le.sha);
                 ctx.locked.insert(key, le);
             }
             Ok(())
@@ -142,7 +161,7 @@ struct SyncParams<'a> {
     repo_root: &'a Path,
     dry_run: bool,
     update: bool,
-    sha_cache: &'a HashMap<(String, String), String>,
+    sha_cache: &'a HashMap<RemoteRefKey, String>,
     locked: &'a BTreeMap<String, LockEntry>,
 }
 
@@ -284,18 +303,40 @@ fn write_github_meta(m: &GithubMeta<'_>) -> Result<(), SkillfileError> {
 }
 
 /// Input for `resolve_sha_for_entry`: coordinates + label + previously-locked SHA.
+enum ShaResolver<'a> {
+    Github,
+    Gitlab { host: &'a str },
+}
+
 struct ShaLookup<'a> {
+    cache_key: RemoteRefKey,
     owner_repo: &'a str,
     ref_: &'a str,
     label: &'a str,
     locked_sha: Option<&'a str>,
+    resolver: ShaResolver<'a>,
 }
 
-/// Resolve the SHA for a GitHub entry, returning `None` in dry-run mode.
+impl ShaResolver<'_> {
+    fn resolve(
+        &self,
+        client: &dyn HttpClient,
+        lookup: &ShaLookup<'_>,
+    ) -> Result<String, SkillfileError> {
+        match self {
+            Self::Github => resolve_github_sha(client, lookup.owner_repo, lookup.ref_),
+            Self::Gitlab { host } => {
+                resolve_gitlab_sha(client, lookup.owner_repo, lookup.ref_, host)
+            }
+        }
+    }
+}
+
+/// Resolve the SHA for a remote entry, returning `None` in dry-run mode.
 ///
 /// Uses locked SHA if available (not in `--update` mode), otherwise looks
-/// up the sha_cache, or resolves via the GitHub API.
-fn resolve_sha_for_entry(
+/// up the sha_cache, or resolves via the forge API.
+fn resolve_remote_sha_for_entry(
     client: &dyn HttpClient,
     q: &ShaLookup<'_>,
     params: &SyncParams<'_>,
@@ -309,8 +350,7 @@ fn resolve_sha_for_entry(
         return Ok(Some(ls.to_owned()));
     }
 
-    let cache_key = (q.owner_repo.to_owned(), q.ref_.to_owned());
-    if let Some(cached) = params.sha_cache.get(&cache_key) {
+    if let Some(cached) = params.sha_cache.get(&q.cache_key) {
         return Ok(Some(cached.clone()));
     }
 
@@ -325,7 +365,7 @@ fn resolve_sha_for_entry(
     }
 
     // Fallback: resolve inline (single-entry mode or missed cache)
-    let sha = resolve_github_sha(client, q.owner_repo, q.ref_)?;
+    let sha = q.resolver.resolve(client, q)?;
     Ok(Some(sha))
 }
 
@@ -383,8 +423,8 @@ fn fetch_store_github(op: &StoreOp<'_>) -> Result<String, SkillfileError> {
     Ok(raw_url)
 }
 
-/// `sha_cache` maps `(owner_repo, ref_)` -> resolved SHA. Pre-populated by
-/// `resolve_shas_parallel` so no mutation is needed here.
+/// `sha_cache` maps a forge-qualified remote ref to its resolved SHA.
+/// Pre-populated by `resolve_shas_parallel` so no mutation is needed here.
 fn sync_github_core(
     client: &dyn HttpClient,
     entry: &Entry,
@@ -417,12 +457,14 @@ fn sync_github_core(
     }
 
     let q = ShaLookup {
+        cache_key: RemoteRefKey::new(ForgeType::Github, owner_repo, ref_),
         owner_repo,
         ref_,
         label: &label,
         locked_sha: locked_sha.as_deref(),
+        resolver: ShaResolver::Github,
     };
-    let Some(sha) = resolve_sha_for_entry(client, &q, params)? else {
+    let Some(sha) = resolve_remote_sha_for_entry(client, &q, params)? else {
         return Ok(None); // dry-run
     };
 
@@ -642,46 +684,6 @@ fn fetch_store_gitlab(op: &GitlabStoreOp<'_>) -> Result<String, SkillfileError> 
     Ok(raw_url)
 }
 
-/// Resolve the SHA for a GitLab entry, returning `None` in dry-run mode.
-struct GitlabShaQuery<'a> {
-    lookup: &'a ShaLookup<'a>,
-    host: &'a str,
-}
-
-fn resolve_gitlab_sha_for_entry(
-    client: &dyn HttpClient,
-    q: &GitlabShaQuery<'_>,
-    params: &SyncParams<'_>,
-) -> Result<Option<String>, SkillfileError> {
-    let l = q.lookup;
-    if let Some(ls) = l.locked_sha {
-        progress!(
-            "{}: re-fetching (locked sha={}) ...",
-            l.label,
-            short_sha(ls)
-        );
-        return Ok(Some(ls.to_owned()));
-    }
-
-    let cache_key = (l.owner_repo.to_owned(), l.ref_.to_owned());
-    if let Some(cached) = params.sha_cache.get(&cache_key) {
-        return Ok(Some(cached.clone()));
-    }
-
-    if params.dry_run {
-        progress!(
-            "{}: resolving {}@{} ... [dry-run]",
-            l.label,
-            l.owner_repo,
-            l.ref_
-        );
-        return Ok(None);
-    }
-
-    let sha = resolve_gitlab_sha(client, l.owner_repo, l.ref_, q.host)?;
-    Ok(Some(sha))
-}
-
 /// Core sync logic for a GitLab entry. Mirrors `sync_github_core`.
 fn sync_gitlab_core(
     client: &dyn HttpClient,
@@ -716,16 +718,14 @@ fn sync_gitlab_core(
     }
 
     let lookup = ShaLookup {
+        cache_key: RemoteRefKey::new(ForgeType::Gitlab, owner_repo, ref_),
         owner_repo,
         ref_,
         label: &label,
         locked_sha: locked_sha.as_deref(),
+        resolver: ShaResolver::Gitlab { host: &host },
     };
-    let q = GitlabShaQuery {
-        lookup: &lookup,
-        host: &host,
-    };
-    let Some(sha) = resolve_gitlab_sha_for_entry(client, &q, params)? else {
+    let Some(sha) = resolve_remote_sha_for_entry(client, &lookup, params)? else {
         return Ok(None); // dry-run
     };
 
@@ -830,30 +830,10 @@ fn sync_entry_core(
     }
 }
 
-/// Which forge a repo+ref pair belongs to, so `resolve_shas_parallel` can
-/// dispatch to the correct SHA resolution function.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum ForgeType {
-    Github,
-    Gitlab,
-}
-
-/// Extract `(owner_repo, ref_)` from any remote source type.
-fn remote_repo_ref(entry: &Entry) -> Option<(&str, &str, ForgeType)> {
-    match &entry.source {
-        SourceFields::Github {
-            owner_repo, ref_, ..
-        } => Some((owner_repo, ref_, ForgeType::Github)),
-        SourceFields::Gitlab {
-            owner_repo, ref_, ..
-        } => Some((owner_repo, ref_, ForgeType::Gitlab)),
-        _ => None,
-    }
-}
-
 struct RepoRef<'a> {
     owner_repo: &'a str,
     ref_: &'a str,
+    forge: ForgeType,
 }
 
 /// Return `true` if the entry matches `rr` and lacks a locked SHA.
@@ -862,10 +842,10 @@ fn entry_needs_resolution(
     rr: &RepoRef<'_>,
     locked: &BTreeMap<String, LockEntry>,
 ) -> bool {
-    let Some((or, r, _)) = remote_repo_ref(e) else {
+    let Some((or, r, forge)) = remote_repo_ref(e) else {
         return false;
     };
-    or == rr.owner_repo && r == rr.ref_ && locked.get(&lock_key(e)).is_none()
+    or == rr.owner_repo && r == rr.ref_ && forge == rr.forge && locked.get(&lock_key(e)).is_none()
 }
 
 /// Return `true` if any entry matching `rr` lacks a locked SHA.
@@ -882,29 +862,32 @@ fn needs_sha_resolution(
         .any(|e| entry_needs_resolution(e, rr, locked))
 }
 
-/// Collect unique `(owner_repo, ref_)` pairs that need SHA resolution,
-/// tagged with their forge type so the resolver knows which API to call.
+/// Collect unique remote refs that need SHA resolution.
 fn collect_pairs_to_resolve(
     entries: &[&Entry],
     locked: &BTreeMap<String, LockEntry>,
     update: bool,
-) -> Vec<(String, String, ForgeType)> {
-    let mut need_resolve: Vec<(String, String, ForgeType)> = Vec::new();
+) -> Vec<RemoteRefKey> {
+    let mut need_resolve = Vec::new();
     let mut seen = HashSet::new();
 
     for entry in entries {
         let Some((owner_repo, ref_, forge)) = remote_repo_ref(entry) else {
             continue;
         };
-        let key_pair = (owner_repo.to_owned(), ref_.to_owned());
-        if !seen.insert(key_pair.clone()) {
+        let key = RemoteRefKey::new(forge, owner_repo, ref_);
+        if !seen.insert(key.clone()) {
             continue;
         }
         // In update mode, always re-resolve. Otherwise, skip if all entries
         // with this repo+ref already have locked SHAs.
-        let rr = RepoRef { owner_repo, ref_ };
+        let rr = RepoRef {
+            owner_repo,
+            ref_,
+            forge,
+        };
         if update || needs_sha_resolution(entries, &rr, locked) {
-            need_resolve.push((key_pair.0, key_pair.1, forge));
+            need_resolve.push(key);
         }
     }
 
@@ -917,48 +900,38 @@ struct ResolveCtx<'a> {
     update: bool,
 }
 
-/// A pending SHA resolution: repo coordinates plus which forge to call.
 struct PendingResolve {
-    owner_repo: String,
-    ref_: String,
-    forge: ForgeType,
+    key: RemoteRefKey,
 }
 
 impl PendingResolve {
     /// Dispatch to the correct forge API.
     fn resolve(&self, client: &dyn HttpClient) -> Result<String, SkillfileError> {
-        match self.forge {
-            ForgeType::Github => resolve_github_sha(client, &self.owner_repo, &self.ref_),
+        match self.key.forge {
+            ForgeType::Github => resolve_github_sha(client, &self.key.owner_repo, &self.key.ref_),
             ForgeType::Gitlab => {
                 let host = crate::http::gitlab_host();
-                resolve_gitlab_sha(client, &self.owner_repo, &self.ref_, &host)
+                resolve_gitlab_sha(client, &self.key.owner_repo, &self.key.ref_, &host)
             }
         }
     }
 }
 
-/// Resolve all unique `(owner_repo, ref_)` SHAs in parallel.
+/// Resolve all unique remote refs in parallel.
 ///
 /// In `--update` mode, all remote entries need resolution (locked SHAs ignored).
 /// In normal mode, only entries without a locked SHA need resolution.
 fn resolve_shas_parallel(
     client: &dyn HttpClient,
     ctx: &ResolveCtx<'_>,
-) -> Result<HashMap<(String, String), String>, SkillfileError> {
-    let triples = collect_pairs_to_resolve(ctx.entries, ctx.locked, ctx.update);
+) -> Result<HashMap<RemoteRefKey, String>, SkillfileError> {
+    let keys = collect_pairs_to_resolve(ctx.entries, ctx.locked, ctx.update);
 
-    if triples.is_empty() {
+    if keys.is_empty() {
         return Ok(HashMap::new());
     }
 
-    let pending: Vec<PendingResolve> = triples
-        .into_iter()
-        .map(|(owner_repo, ref_, forge)| PendingResolve {
-            owner_repo,
-            ref_,
-            forge,
-        })
-        .collect();
+    let pending: Vec<PendingResolve> = keys.into_iter().map(|key| PendingResolve { key }).collect();
 
     // Resolve in parallel using scoped threads — borrows avoid cloning.
     let results: Vec<Result<String, SkillfileError>> = std::thread::scope(|s| {
@@ -977,11 +950,11 @@ fn resolve_shas_parallel(
         let sha = result?;
         progress!(
             "  resolved {}@{} -> {}",
-            p.owner_repo,
-            p.ref_,
+            p.key.owner_repo,
+            p.key.ref_,
             short_sha(&sha)
         );
-        cache.insert((p.owner_repo, p.ref_), sha);
+        cache.insert(p.key, sha);
     }
     Ok(cache)
 }
@@ -1252,8 +1225,8 @@ mod tests {
     use crate::http::HttpClient;
 
     use super::{
-        content_exists, fetch_dir_at_sha, fetch_file_at_sha, sync_entry, vendor_dir_for,
-        SyncContext, VENDOR_DIR,
+        content_exists, fetch_dir_at_sha, fetch_file_at_sha, resolve_shas_parallel, sync_entry,
+        vendor_dir_for, ForgeType, RemoteRefKey, ResolveCtx, SyncContext, VENDOR_DIR,
     };
 
     // -----------------------------------------------------------------------
@@ -1662,15 +1635,118 @@ mod tests {
 
         sync_entry(&client, &entry1, &mut ctx).unwrap();
         // After the first call the SHA must be in the cache
-        assert!(ctx
-            .sha_cache
-            .contains_key(&("owner/repo".to_string(), "main".to_string())));
+        assert!(ctx.sha_cache.contains_key(&RemoteRefKey::new(
+            ForgeType::Github,
+            "owner/repo",
+            "main"
+        )));
 
         // The second call must succeed using the cached SHA (no second get_json call)
         sync_entry(&client, &entry2, &mut ctx).unwrap();
 
         assert!(ctx.locked.contains_key("github/skill/skill-one"));
         assert!(ctx.locked.contains_key("github/skill/skill-two"));
+    }
+
+    #[test]
+    fn sync_entry_sha_cache_isolated_between_forges() {
+        let github_sha = "1111111111111111111111111111111111111111";
+        let gitlab_sha = "2222222222222222222222222222222222222222";
+        let dir = tempfile::tempdir().unwrap();
+
+        let github_entry = Entry {
+            entity_type: EntityType::Skill,
+            name: "gh-skill".into(),
+            source: SourceFields::Github {
+                owner_repo: "shared/repo".into(),
+                path_in_repo: "skills/gh.md".into(),
+                ref_: "main".into(),
+            },
+        };
+        let gitlab_entry = Entry {
+            entity_type: EntityType::Skill,
+            name: "gl-skill".into(),
+            source: SourceFields::Gitlab {
+                owner_repo: "shared/repo".into(),
+                path_in_repo: "skills/gl.md".into(),
+                ref_: "main".into(),
+            },
+        };
+
+        let github_sha_url = "https://api.github.com/repos/shared/repo/commits/main".to_string();
+        let gitlab_sha_url =
+            "https://gitlab.com/api/v4/projects/shared%2Frepo/repository/commits/main".to_string();
+        let github_sha_json = serde_json::json!({ "sha": github_sha }).to_string();
+        let gitlab_sha_json = serde_json::json!({ "id": gitlab_sha }).to_string();
+        let github_raw_url =
+            format!("https://raw.githubusercontent.com/shared/repo/{github_sha}/skills/gh.md");
+        let gitlab_raw_url = format!(
+            "https://gitlab.com/api/v4/projects/shared%2Frepo/repository/files/skills%2Fgl.md/raw?ref={gitlab_sha}"
+        );
+
+        let client = MockClient::new()
+            .with_json(github_sha_url, Some(github_sha_json))
+            .with_json(gitlab_sha_url, Some(gitlab_sha_json))
+            .with_bytes(github_raw_url, b"# GitHub".to_vec())
+            .with_bytes(gitlab_raw_url, b"# GitLab".to_vec());
+
+        let mut ctx = make_sync_ctx(dir.path());
+        sync_entry(&client, &github_entry, &mut ctx).unwrap();
+        sync_entry(&client, &gitlab_entry, &mut ctx).unwrap();
+
+        assert_eq!(ctx.locked["github/skill/gh-skill"].sha, github_sha);
+        assert_eq!(ctx.locked["gitlab/skill/gl-skill"].sha, gitlab_sha);
+    }
+
+    #[test]
+    fn resolve_shas_parallel_does_not_dedup_across_forges() {
+        let github_entry = Entry {
+            entity_type: EntityType::Skill,
+            name: "gh-skill".into(),
+            source: SourceFields::Github {
+                owner_repo: "shared/repo".into(),
+                path_in_repo: "skills/gh.md".into(),
+                ref_: "main".into(),
+            },
+        };
+        let gitlab_entry = Entry {
+            entity_type: EntityType::Skill,
+            name: "gl-skill".into(),
+            source: SourceFields::Gitlab {
+                owner_repo: "shared/repo".into(),
+                path_in_repo: "skills/gl.md".into(),
+                ref_: "main".into(),
+            },
+        };
+        let entries = [&github_entry, &gitlab_entry];
+
+        let client = MockClient::new()
+            .with_json(
+                "https://api.github.com/repos/shared/repo/commits/main",
+                Some(serde_json::json!({ "sha": "githubsha" }).to_string()),
+            )
+            .with_json(
+                "https://gitlab.com/api/v4/projects/shared%2Frepo/repository/commits/main",
+                Some(serde_json::json!({ "id": "gitlabsha" }).to_string()),
+            );
+        let locked = BTreeMap::new();
+        let resolve_ctx = ResolveCtx {
+            entries: &entries,
+            locked: &locked,
+            update: false,
+        };
+
+        let cache = resolve_shas_parallel(&client, &resolve_ctx).unwrap();
+
+        assert_eq!(cache.len(), 2);
+        assert_eq!(
+            cache[&RemoteRefKey::new(ForgeType::Github, "shared/repo", "main")],
+            "githubsha"
+        );
+        assert_eq!(
+            cache[&RemoteRefKey::new(ForgeType::Gitlab, "shared/repo", "main")],
+            "gitlabsha"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2155,8 +2231,9 @@ mod tests {
         let entry = gitlab_skill_entry("release-helper", "skills/release-helper");
 
         let encoded_project = "group%2Fproject";
+        let encoded_path = "skills%2Frelease-helper";
         let tree_url = format!(
-            "https://gitlab.com/api/v4/projects/{encoded_project}/repository/tree?ref={sha}&recursive=true&per_page=100&path=skills/release-helper"
+            "https://gitlab.com/api/v4/projects/{encoded_project}/repository/tree?ref={sha}&recursive=true&per_page=100&page=1&path={encoded_path}"
         );
         let tree_json = r#"[
             {"path": "skills/release-helper/SKILL.md", "type": "blob"},
