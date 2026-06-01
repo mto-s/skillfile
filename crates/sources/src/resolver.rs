@@ -18,6 +18,10 @@ fn encode_url_path(path: &str) -> String {
         .join("/")
 }
 
+fn encode_query_value(value: &str) -> String {
+    encode_path_segment(value)
+}
+
 /// Percent-encode a single path segment (RFC 3986 unreserved characters
 /// pass through, everything else becomes %XX).
 fn encode_path_segment(segment: &str) -> String {
@@ -157,7 +161,47 @@ pub fn resolve_github_sha(
 
 fn gitlab_api_commit_url(host: &str, owner_repo: &str, ref_: &str) -> String {
     let encoded = owner_repo.replace('/', "%2F");
-    format!("https://{host}/api/v4/projects/{encoded}/repository/commits/{ref_}")
+    let encoded_ref = encode_query_value(ref_);
+    format!("https://{host}/api/v4/projects/{encoded}/repository/commits/{encoded_ref}")
+}
+
+fn gitlab_project_url(host: &str, owner_repo: &str) -> String {
+    let encoded = owner_repo.replace('/', "%2F");
+    format!("https://{host}/api/v4/projects/{encoded}")
+}
+
+fn fetch_gitlab_default_branch(
+    client: &dyn HttpClient,
+    owner_repo: &str,
+    host: &str,
+) -> Option<String> {
+    let url = gitlab_project_url(host, owner_repo);
+    let text = client.get_json(&url).ok()??;
+    let data: serde_json::Value = serde_json::from_str(&text).ok()?;
+    data["default_branch"].as_str().map(ToString::to_string)
+}
+
+fn non_legacy_gitlab_default_branch(
+    client: &dyn HttpClient,
+    owner_repo: &str,
+    host: &str,
+) -> Option<String> {
+    let branch = fetch_gitlab_default_branch(client, owner_repo, host)?;
+    if branch == "main" || branch == "master" {
+        return None;
+    }
+    Some(branch)
+}
+
+fn resolve_gitlab_default_branch_sha(
+    client: &dyn HttpClient,
+    owner_repo: &str,
+    host: &str,
+) -> Result<Option<String>, SkillfileError> {
+    let Some(default_branch) = non_legacy_gitlab_default_branch(client, owner_repo, host) else {
+        return Ok(None);
+    };
+    try_resolve_gitlab_sha(client, owner_repo, &default_branch, host)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -190,14 +234,11 @@ pub fn resolve_gitlab_sha(
     if let Some(sha) = try_resolve_gitlab_sha(client, owner_repo, ref_, host)? {
         return Ok(sha);
     }
-    // Fall back: main <-> master
-    let fallback = match ref_ {
-        "main" => Some("master"),
-        "master" => Some("main"),
-        _ => None,
-    };
-    if let Some(fb) = fallback {
+    if let Some(fb) = fallback_branch(ref_) {
         if let Some(sha) = try_resolve_gitlab_sha(client, owner_repo, fb, host)? {
+            return Ok(sha);
+        }
+        if let Some(sha) = resolve_gitlab_default_branch_sha(client, owner_repo, host)? {
             return Ok(sha);
         }
     }
@@ -244,10 +285,40 @@ pub struct GitlabFetch<'a> {
 fn gitlab_file_url(gl: &GitlabFetch<'_>, path: &str) -> String {
     let encoded_project = gl.owner_repo.replace('/', "%2F");
     let encoded_path = encode_url_path(path).replace('/', "%2F");
-    let (host, ref_) = (gl.host, gl.ref_);
+    let encoded_ref = encode_query_value(gl.ref_);
+    let host = gl.host;
     format!(
-        "https://{host}/api/v4/projects/{encoded_project}/repository/files/{encoded_path}/raw?ref={ref_}"
+        "https://{host}/api/v4/projects/{encoded_project}/repository/files/{encoded_path}/raw?ref={encoded_ref}"
     )
+}
+
+const GITLAB_TREE_PAGE_SIZE: usize = 100;
+
+fn gitlab_tree_url(gl: &GitlabFetch<'_>, base_path: &str, page: usize) -> String {
+    let encoded_project = gl.owner_repo.replace('/', "%2F");
+    let encoded_ref = encode_query_value(gl.ref_);
+    let encoded_path = encode_query_value(base_path);
+    format!(
+        "https://{}/api/v4/projects/{encoded_project}/repository/tree?ref={encoded_ref}&recursive=true&per_page={GITLAB_TREE_PAGE_SIZE}&page={page}&path={encoded_path}",
+        gl.host
+    )
+}
+
+fn gitlab_tree_blob_entry(
+    item: &serde_json::Value,
+    prefix: &str,
+    gl: &GitlabFetch<'_>,
+) -> Option<DirEntry> {
+    if item["type"].as_str() != Some("blob") {
+        return None;
+    }
+    let path = item["path"].as_str()?;
+    let relative_path = path.strip_prefix(prefix)?.to_string();
+    let download_url = gitlab_file_url(gl, path);
+    Some(DirEntry {
+        relative_path,
+        download_url,
+    })
 }
 
 pub fn fetch_gitlab_file(
@@ -267,38 +338,39 @@ pub(crate) fn list_gitlab_dir_recursive(
     gl: &GitlabFetch<'_>,
     base_path: &str,
 ) -> Result<Vec<DirEntry>, SkillfileError> {
-    let encoded = gl.owner_repo.replace('/', "%2F");
     let trimmed = base_path.trim_end_matches('/');
-    // Use GitLab's `path` parameter to scope the tree to the target directory,
-    // avoiding pagination issues on large repos.
-    let encoded_path = encode_url_path(trimmed);
-    let url = format!(
-        "https://{}/api/v4/projects/{}/repository/tree?ref={}&recursive=true&per_page=100&path={}",
-        gl.host, encoded, gl.ref_, encoded_path
-    );
-    let Some(text) = gl.client.get_json(&url)? else {
-        return Ok(Vec::new());
-    };
-    // GitLab returns a flat JSON array, not {"tree": [...]} like GitHub.
-    // With the `path` parameter, returned paths are still repo-absolute.
-    let items: Vec<serde_json::Value> = serde_json::from_str(&text)
-        .map_err(|e| SkillfileError::Network(format!("invalid GitLab tree JSON: {e}")))?;
-
     let prefix = format!("{trimmed}/");
+    let mut entries = Vec::new();
+    let mut page = 1;
 
-    let entries = items
-        .iter()
-        .filter(|item| item["type"].as_str() == Some("blob"))
-        .filter_map(|item| {
-            let path = item["path"].as_str()?;
-            let relative_path = path.strip_prefix(&prefix)?.to_string();
-            let download_url = gitlab_file_url(gl, path);
-            Some(DirEntry {
-                relative_path,
-                download_url,
-            })
-        })
-        .collect();
+    loop {
+        // Use GitLab's `path` parameter to scope the tree to the target
+        // directory, then page until fewer than GITLAB_TREE_PAGE_SIZE results
+        // are returned.
+        let url = gitlab_tree_url(gl, trimmed, page);
+        let Some(text) = gl.client.get_json(&url)? else {
+            break;
+        };
+        // GitLab returns a flat JSON array, not {"tree": [...]} like GitHub.
+        // With the `path` parameter, returned paths are still repo-absolute.
+        let items: Vec<serde_json::Value> = serde_json::from_str(&text)
+            .map_err(|e| SkillfileError::Network(format!("invalid GitLab tree JSON: {e}")))?;
+
+        if items.is_empty() {
+            break;
+        }
+
+        entries.extend(
+            items
+                .iter()
+                .filter_map(|item| gitlab_tree_blob_entry(item, &prefix, gl)),
+        );
+
+        if items.len() < GITLAB_TREE_PAGE_SIZE {
+            break;
+        }
+        page += 1;
+    }
 
     Ok(entries)
 }
@@ -2114,7 +2186,8 @@ mod tests {
 
     fn gitlab_commit_url(owner_repo: &str, ref_: &str) -> String {
         let encoded = owner_repo.replace('/', "%2F");
-        format!("https://gitlab.com/api/v4/projects/{encoded}/repository/commits/{ref_}")
+        let encoded_ref = encode_query_value(ref_);
+        format!("https://gitlab.com/api/v4/projects/{encoded}/repository/commits/{encoded_ref}")
     }
 
     fn gitlab_sha_json(sha: &str) -> String {
@@ -2143,6 +2216,17 @@ mod tests {
 
         let sha = resolve_gitlab_sha(&client, "group/repo", "v1.0.0", "gitlab.com").unwrap();
         assert_eq!(sha, "cafebabe12345678");
+    }
+
+    #[test]
+    fn resolve_gitlab_sha_encodes_slashy_ref() {
+        let mut client = MockClient::new();
+        let url = gitlab_commit_url("group/repo", "feature/cool-stuff");
+        client.add_json(&url, &gitlab_sha_json("branchsha1234"));
+
+        let sha =
+            resolve_gitlab_sha(&client, "group/repo", "feature/cool-stuff", "gitlab.com").unwrap();
+        assert_eq!(sha, "branchsha1234");
     }
 
     #[test]
@@ -2205,6 +2289,24 @@ mod tests {
     }
 
     #[test]
+    fn resolve_gitlab_sha_falls_back_to_default_branch() {
+        let mut client = MockClient::new();
+        client.add_json_none(&gitlab_commit_url("group/repo", "main"));
+        client.add_json_none(&gitlab_commit_url("group/repo", "master"));
+        client.add_json(
+            &gitlab_project_url("gitlab.com", "group/repo"),
+            r#"{"default_branch": "trunk"}"#,
+        );
+        client.add_json(
+            &gitlab_commit_url("group/repo", "trunk"),
+            &gitlab_sha_json("trunksha1234"),
+        );
+
+        let sha = resolve_gitlab_sha(&client, "group/repo", "main", "gitlab.com").unwrap();
+        assert_eq!(sha, "trunksha1234");
+    }
+
+    #[test]
     fn resolve_gitlab_sha_fails_when_both_branches_absent() {
         let mut client = MockClient::new();
         client.add_json_none(&gitlab_commit_url("group/repo", "main"));
@@ -2220,10 +2322,23 @@ mod tests {
     // GitLab fetch helpers
     // -----------------------------------------------------------------------
 
-    fn gitlab_tree_url(owner_repo: &str, ref_: &str, path: &str) -> String {
+    struct TestGitlabTree<'a> {
+        owner_repo: &'a str,
+        ref_: &'a str,
+        path: &'a str,
+    }
+
+    fn gitlab_tree_url(tree: &TestGitlabTree<'_>, page: usize) -> String {
+        let TestGitlabTree {
+            owner_repo,
+            ref_,
+            path,
+        } = tree;
         let encoded = owner_repo.replace('/', "%2F");
+        let encoded_ref = encode_query_value(ref_);
+        let encoded_path = encode_query_value(path);
         format!(
-            "https://gitlab.com/api/v4/projects/{encoded}/repository/tree?ref={ref_}&recursive=true&per_page=100&path={path}"
+            "https://gitlab.com/api/v4/projects/{encoded}/repository/tree?ref={encoded_ref}&recursive=true&per_page=100&page={page}&path={encoded_path}"
         )
     }
 
@@ -2273,6 +2388,27 @@ mod tests {
     }
 
     #[test]
+    fn fetch_gitlab_file_encodes_ref_query() {
+        let encoded_project = "group%2Fproject";
+        let encoded_path = "skills%2Fgit.md";
+        let encoded_ref = "feature%2Fgitlab";
+        let url = format!(
+            "https://gitlab.com/api/v4/projects/{encoded_project}/repository/files/{encoded_path}/raw?ref={encoded_ref}"
+        );
+        let mut client = MockClient::new();
+        client.add_bytes(&url, b"# Git skill".to_vec());
+
+        let gl = GitlabFetch {
+            client: &client,
+            owner_repo: "group/project",
+            ref_: "feature/gitlab",
+            host: "gitlab.com",
+        };
+        let result = fetch_gitlab_file(&gl, "skills/git.md").unwrap();
+        assert_eq!(result, b"# Git skill");
+    }
+
+    #[test]
     fn fetch_gitlab_file_propagates_error() {
         let sha = "fff000";
         let encoded_project = "group%2Fproject";
@@ -2301,7 +2437,14 @@ mod tests {
     fn list_gitlab_dir_recursive_returns_blobs_under_prefix() {
         let owner_repo = "group/project";
         let ref_ = "main";
-        let url = gitlab_tree_url(owner_repo, ref_, "skills/dir");
+        let url = gitlab_tree_url(
+            &TestGitlabTree {
+                owner_repo,
+                ref_,
+                path: "skills/dir",
+            },
+            1,
+        );
 
         // GitLab tree API returns a flat JSON array (not {"tree": [...]})
         let json = r#"[
@@ -2333,7 +2476,14 @@ mod tests {
     fn list_gitlab_dir_recursive_download_urls_use_file_api() {
         let owner_repo = "mygroup/myrepo";
         let ref_ = "abc123sha";
-        let url = gitlab_tree_url(owner_repo, ref_, "skills/python");
+        let url = gitlab_tree_url(
+            &TestGitlabTree {
+                owner_repo,
+                ref_,
+                path: "skills/python",
+            },
+            1,
+        );
 
         let json = r#"[{"path": "skills/python/SKILL.md", "type": "blob"}]"#;
 
@@ -2359,7 +2509,14 @@ mod tests {
     fn list_gitlab_dir_recursive_empty_returns_empty() {
         let owner_repo = "group/project";
         let ref_ = "main";
-        let url = gitlab_tree_url(owner_repo, ref_, "skills/dir");
+        let url = gitlab_tree_url(
+            &TestGitlabTree {
+                owner_repo,
+                ref_,
+                path: "skills/dir",
+            },
+            1,
+        );
 
         let mut client = MockClient::new();
         client.add_json(&url, "[]");
@@ -2378,7 +2535,14 @@ mod tests {
     fn list_gitlab_dir_recursive_4xx_returns_empty() {
         let owner_repo = "group/project";
         let ref_ = "main";
-        let url = gitlab_tree_url(owner_repo, ref_, "skills/dir");
+        let url = gitlab_tree_url(
+            &TestGitlabTree {
+                owner_repo,
+                ref_,
+                path: "skills/dir",
+            },
+            1,
+        );
 
         let mut client = MockClient::new();
         client.add_json_none(&url);
@@ -2391,5 +2555,47 @@ mod tests {
         };
         let entries = list_gitlab_dir_recursive(&gl, "skills/dir").unwrap();
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn list_gitlab_dir_recursive_fetches_multiple_pages() {
+        let owner_repo = "group/project";
+        let ref_ = "main";
+        let tree = TestGitlabTree {
+            owner_repo,
+            ref_,
+            path: "skills/dir",
+        };
+        let page_one = gitlab_tree_url(&tree, 1);
+        let page_two = gitlab_tree_url(&tree, 2);
+
+        let full_page_items = (0..100)
+            .map(|idx| format!(r#"{{"path": "skills/dir/file{idx}.md", "type": "blob"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let page_one_json = format!("[{full_page_items}]");
+        let page_two_json = r#"[
+            {"path": "skills/dir/final.md", "type": "blob"}
+        ]"#;
+
+        let mut client = MockClient::new();
+        client.add_json(&page_one, &page_one_json);
+        client.add_json(&page_two, page_two_json);
+
+        let gl = GitlabFetch {
+            client: &client,
+            owner_repo,
+            ref_,
+            host: "gitlab.com",
+        };
+        let entries = list_gitlab_dir_recursive(&gl, "skills/dir").unwrap();
+
+        assert_eq!(entries.len(), 101);
+        assert!(entries
+            .iter()
+            .any(|entry| entry.relative_path == "file0.md"));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.relative_path == "final.md"));
     }
 }

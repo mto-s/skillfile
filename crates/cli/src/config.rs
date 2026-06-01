@@ -247,12 +247,16 @@ pub fn write_gitlab_config_token(token: &str) -> Result<(), std::io::Error> {
             "could not determine config directory",
         )
     })?;
+    write_gitlab_config_token_to(token, &path)
+}
+
+fn write_gitlab_config_token_to(token: &str, path: &Path) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut config = read_config_from(&path);
+    let mut config = read_config_from(path);
     config.gitlab_token = Some(token.to_string());
-    write_config_to(&config, &path)
+    write_config_to(&config, path)
 }
 
 /// If the manifest has no install targets, fill them from the user config.
@@ -600,9 +604,7 @@ mod tests {
         }];
         write_user_targets_to(&targets, &path).unwrap();
 
-        let mut config = read_config_from(&path);
-        config.gitlab_token = Some("glpat-preserved".to_string());
-        write_config_to(&config, &path).unwrap();
+        write_gitlab_config_token_to("glpat-preserved", &path).unwrap();
 
         let result = read_config_from(&path);
         assert_eq!(result.gitlab_token.as_deref(), Some("glpat-preserved"));

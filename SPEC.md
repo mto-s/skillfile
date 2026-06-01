@@ -21,7 +21,7 @@ A Skillfile consists of lines, each of which is one of:
 - **Blank line** — ignored
 - **Comment line** — starts with `#` (after optional whitespace), ignored
 - **`install` line** — declares a deployment target
-- **Entry line** — declares a skill or agent to manage (`local`, `github`, or `url`)
+- **Entry line** — declares a skill or agent to manage (`local`, `github`, `gitlab`, or `url`)
 
 ### Inline Comments
 
@@ -82,6 +82,22 @@ github  <entity-type>  [name]  <owner/repo[@ref]>  <path-in-repo>  [ref]
 | `path-in-repo` | Path to the `.md` file within the repo. Use `.` if SKILL.md is at the repo root. |
 | `ref` | Branch, tag, or commit SHA. Defaults to `main` if omitted. Ignored when `@ref` is present in `owner/repo`. |
 
+### GitLab
+
+```
+gitlab  <entity-type>  [name]  <group/project>  <path-in-repo>  [ref]
+```
+
+| Field | Description |
+|---|---|
+| `entity-type` | `skill` or `agent` |
+| `name` | Optional logical name. If omitted, inferred from the filename stem of `path-in-repo`. |
+| `group/project` | GitLab project path. Subgroups are allowed (for example `group/subgroup/project`). |
+| `path-in-repo` | Path to the `.md` file within the project. Use `.` if `SKILL.md` is at the project root. |
+| `ref` | Branch, tag, or commit SHA. Defaults to `main` if omitted. |
+
+GitLab host selection is configured out-of-band via `GITLAB_HOST` or user config, not in the manifest line itself.
+
 ### URL
 
 ```
@@ -108,7 +124,7 @@ When the `name` field is omitted, it is inferred from the source path:
 2. Strip the `.md` extension if present
 3. The result is the name
 
-For GitHub entries, a field containing `/` is treated as `owner/repo`, not as a name. This disambiguates the positional fields.
+For GitHub and GitLab entries, a field containing `/` is treated as the repository or project path, not as a name. This disambiguates the positional fields.
 
 ### Uniqueness
 

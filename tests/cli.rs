@@ -715,6 +715,50 @@ fn add_github_at_ref_takes_priority_over_positional_ref() {
     );
 }
 
+#[test]
+fn add_gitlab_subcommand_works_with_explicit_ref() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Skillfile"), "# empty\n").unwrap();
+
+    let output = sf(dir.path())
+        .env(
+            "SKILLFILE_CONFIG_PATH",
+            dir.path().join("missing-config.toml"),
+        )
+        .args([
+            "add",
+            "gitlab",
+            "skill",
+            "group/project",
+            "skills/SKILL.md",
+            "release/v1",
+        ])
+        .timeout(std::time::Duration::from_secs(10))
+        .output()
+        .expect("failed to execute");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "gitlab add should succeed without install targets: {stderr}"
+    );
+    assert!(
+        stdout.contains("Added: gitlab  skill  group/project  skills/SKILL.md  release/v1"),
+        "gitlab add should print the added entry, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("No install targets configured yet"),
+        "gitlab add should follow the direct add path, got: {stdout}"
+    );
+
+    let skillfile = std::fs::read_to_string(dir.path().join("Skillfile")).unwrap();
+    assert!(
+        skillfile.contains("gitlab  skill  group/project  skills/SKILL.md  release/v1"),
+        "gitlab add should persist the entry, got:\n{skillfile}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // add wizard: CLI routing
 // ---------------------------------------------------------------------------
