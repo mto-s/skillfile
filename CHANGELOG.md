@@ -4,6 +4,16 @@ All notable changes to skillfile are documented here.
 
 ---
 
+## v1.7.0 - 01-06-2026
+
+### Added
+
+- **GitLab support** by @jamisonbryant
+
+### Changed
+
+- Bumped `serde_json` to 1.0.150.
+
 ## v1.6.4 - 26-05-2026
 
 ### Added
