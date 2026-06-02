@@ -4,6 +4,12 @@ All notable changes to skillfile are documented here.
 
 ---
 
+## v1.7.1 - 02-06-2026
+
+### Fixed
+
+- **Root repo skills now keep helper files and use the repo name when added from `.`** - adding a skill from the repository root now installs the full root payload, including helper files like `scripts/extract.py`, instead of falling back to a single `SKILL.md` install.
+
 ## v1.7.0 - 01-06-2026
 
 ### Added
