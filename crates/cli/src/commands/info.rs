@@ -8,7 +8,7 @@ use skillfile_core::patch::walkdir;
 use skillfile_core::patch::{has_dir_patch, has_patch, patch_path, patches_root};
 use skillfile_deploy::adapter::{adapters, AdapterScope, DirInstallMode};
 use skillfile_deploy::paths::{installed_paths, source_path};
-use skillfile_sources::strategy::{content_file, is_dir_entry};
+use skillfile_sources::strategy::{content_file, is_cached_dir_entry};
 use skillfile_sources::sync::vendor_dir_for;
 
 use super::status::is_modified_local;
@@ -91,7 +91,8 @@ fn format_installed_paths(
     manifest: &Manifest,
     repo_root: &Path,
 ) -> Result<Vec<String>, SkillfileError> {
-    let locations = if is_dir_entry(entry) {
+    let vdir = vendor_dir_for(entry, repo_root);
+    let locations = if is_cached_dir_entry(entry, &vdir) {
         installed_locations_for_dir_entry(entry, manifest, repo_root)?
     } else {
         installed_locations_for_single_file(entry, manifest, repo_root)?
@@ -185,7 +186,7 @@ fn flat_dir_locations(
 
 fn format_cache_path(entry: &Entry, repo_root: &Path) -> String {
     let vdir = vendor_dir_for(entry, repo_root);
-    if is_dir_entry(entry) {
+    if is_cached_dir_entry(entry, &vdir) {
         if vdir.is_dir() {
             vdir.display().to_string()
         } else {

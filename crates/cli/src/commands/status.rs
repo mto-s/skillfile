@@ -10,7 +10,7 @@ use skillfile_core::patch::{
     apply_patch_pure, dir_patch_path, has_dir_patch, has_patch, read_patch, walkdir,
 };
 use skillfile_deploy::paths::{installed_dir_file_sets, installed_paths};
-use skillfile_sources::strategy::{content_file, is_dir_entry, meta_sha};
+use skillfile_sources::strategy::{content_file, is_cached_dir_entry, meta_sha};
 use skillfile_sources::sync::vendor_dir_for;
 
 struct DirCheckCtx<'a> {
@@ -149,7 +149,8 @@ pub(crate) fn is_modified_local(entry: &Entry, manifest: &Manifest, repo_root: &
     if matches!(entry.source, SourceFields::Local { .. }) {
         return false;
     }
-    if is_dir_entry(entry) {
+    let vdir = vendor_dir_for(entry, repo_root);
+    if is_cached_dir_entry(entry, &vdir) {
         return is_dir_modified_local(entry, manifest, repo_root);
     }
     check_single_file_modified(entry, manifest, repo_root).unwrap_or(false)
@@ -163,7 +164,8 @@ enum InstallState {
 }
 
 fn install_state(entry: &Entry, manifest: &Manifest, repo_root: &Path) -> InstallState {
-    if is_dir_entry(entry) {
+    let vdir = vendor_dir_for(entry, repo_root);
+    if is_cached_dir_entry(entry, &vdir) {
         dir_install_state(entry, manifest, repo_root).unwrap_or(InstallState::NotInstalled)
     } else {
         single_file_install_state(entry, manifest, repo_root).unwrap_or(InstallState::NotInstalled)

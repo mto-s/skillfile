@@ -8,7 +8,7 @@ use skillfile_core::lock::{lock_key, read_lock};
 use skillfile_core::models::{short_sha, Entry};
 use skillfile_core::parser::{find_entry_in, parse_manifest, MANIFEST_NAME};
 use skillfile_core::progress;
-use skillfile_sources::strategy::{content_file, is_dir_entry};
+use skillfile_sources::strategy::{content_file, is_cached_dir_entry};
 use skillfile_sources::sync::vendor_dir_for;
 
 use crate::commands::installed_variants::{installed_dir_variants, installed_single_file_variants};
@@ -199,7 +199,8 @@ pub fn cmd_diff(name: &str, repo_root: &Path) -> Result<(), SkillfileError> {
     }
     let sha = locked[&key].sha.clone();
 
-    if is_dir_entry(entry) {
+    let vdir = vendor_dir_for(entry, repo_root);
+    if is_cached_dir_entry(entry, &vdir) {
         diff_local_dir(entry, &sha, repo_root)
     } else {
         diff_local_single(entry, &sha, repo_root)
@@ -209,7 +210,7 @@ pub fn cmd_diff(name: &str, repo_root: &Path) -> Result<(), SkillfileError> {
 fn diff_conflict(
     entry: &Entry,
     conflict: &skillfile_core::models::ConflictState,
-    _repo_root: &Path,
+    repo_root: &Path,
 ) -> Result<(), SkillfileError> {
     // Conflict mode: fetch old and new upstream, show upstream delta
     // This requires network access
@@ -219,7 +220,8 @@ fn diff_conflict(
     );
     let client = skillfile_sources::http::UreqClient::new();
 
-    if is_dir_entry(entry) {
+    let vdir = vendor_dir_for(entry, repo_root);
+    if is_cached_dir_entry(entry, &vdir) {
         diff_conflict_dir(entry, conflict, &client)?;
     } else {
         diff_conflict_single(entry, conflict, &client)?;

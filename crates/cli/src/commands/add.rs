@@ -88,8 +88,20 @@ pub struct GithubEntryArgs<'a> {
     pub name: Option<&'a str>,
 }
 
+fn infer_remote_entry_name(owner_repo: &str, path: &str) -> String {
+    if path == "." {
+        return owner_repo
+            .rsplit('/')
+            .next()
+            .filter(|segment| !segment.is_empty())
+            .unwrap_or("content")
+            .to_string();
+    }
+    infer_name(path)
+}
+
 pub fn entry_from_github(args: &GithubEntryArgs<'_>) -> Entry {
-    let inferred = infer_name(args.path);
+    let inferred = infer_remote_entry_name(args.owner_repo, args.path);
     Entry {
         entity_type: EntityType::parse(args.entity_type).unwrap_or(EntityType::Skill),
         name: args.name.unwrap_or(&inferred).to_string(),
@@ -110,7 +122,7 @@ pub struct GitlabEntryArgs<'a> {
 }
 
 pub fn entry_from_gitlab(args: &GitlabEntryArgs<'_>) -> Entry {
-    let inferred = infer_name(args.path);
+    let inferred = infer_remote_entry_name(args.owner_repo, args.path);
     Entry {
         entity_type: EntityType::parse(args.entity_type).unwrap_or(EntityType::Skill),
         name: args.name.unwrap_or(&inferred).to_string(),
@@ -1125,9 +1137,25 @@ mod tests {
             ref_: None,
             name: None,
         });
-        assert_eq!(entry.name, "content");
+        assert_eq!(entry.name, "project");
         let (_, pir, _) = entry.source.as_gitlab().unwrap();
         assert_eq!(pir, ".");
+    }
+
+    #[test]
+    fn entry_from_github_dot_path_uses_repo_slug() {
+        let entry = entry_from_github(&GithubEntryArgs {
+            entity_type: "skill",
+            owner_repo: "virgiliojr94/book-to-skill",
+            path: ".",
+            ref_: None,
+            name: None,
+        });
+        assert_eq!(entry.name, "book-to-skill");
+        let (owner_repo, path_in_repo, ref_) = entry.source.as_github().unwrap();
+        assert_eq!(owner_repo, "virgiliojr94/book-to-skill");
+        assert_eq!(path_in_repo, ".");
+        assert_eq!(ref_, DEFAULT_REF);
     }
 
     #[test]

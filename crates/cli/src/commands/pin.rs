@@ -6,7 +6,7 @@ use skillfile_core::lock::{lock_key, read_lock};
 use skillfile_core::models::Entry;
 use skillfile_core::parser::{find_entry_in, parse_manifest, MANIFEST_NAME};
 use skillfile_deploy::install::install_entry;
-use skillfile_sources::strategy::{content_file, is_dir_entry};
+use skillfile_sources::strategy::{content_file, is_cached_dir_entry};
 use skillfile_sources::sync::vendor_dir_for;
 
 use crate::commands::installed_variants::{installed_dir_variants, installed_single_file_variants};
@@ -220,12 +220,12 @@ fn pin_entry(entry: &Entry, repo_root: &Path, dry_run: bool) -> Result<String, S
         )));
     }
 
-    if is_dir_entry(entry) {
+    let vdir = vendor_dir_for(entry, repo_root);
+    if is_cached_dir_entry(entry, &vdir) {
         return pin_dir_entry(entry, repo_root, dry_run);
     }
 
     // Single-file entry
-    let vdir = vendor_dir_for(entry, repo_root);
     let cf = content_file(entry);
     let cache_file = if cf.is_empty() {
         return Err(SkillfileError::Manifest(format!(

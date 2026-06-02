@@ -215,6 +215,69 @@ fn install_update() {
 
 #[test]
 #[serial]
+fn add_github_root_skill_repo_installs_scripts() {
+    if !require_github_token() {
+        return;
+    }
+
+    let (dir, output) = retry(retry_delays(), || {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Skillfile"),
+            "install  claude-code  local\n",
+        )
+        .unwrap();
+
+        let output = sf(dir.path())
+            .args([
+                "add",
+                "github",
+                "skill",
+                "virgiliojr94/book-to-skill",
+                "--no-interactive",
+            ])
+            .output()
+            .expect("failed to execute skillfile");
+
+        if output.status.success() {
+            Ok((dir, output))
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("  retry: add root skill repo failed: {stderr}");
+            Err(stderr.to_string())
+        }
+    })
+    .expect("command failed after all retry attempts");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Added: github  skill  book-to-skill  virgiliojr94/book-to-skill  ."),
+        "expected add output to use the repo slug and root path, got:\n{stdout}"
+    );
+
+    let skill_dir = dir.path().join(".claude/skills/book-to-skill");
+    assert!(
+        skill_dir.join("SKILL.md").exists(),
+        "root skill SKILL.md should be installed"
+    );
+    assert!(
+        skill_dir.join("scripts/extract.py").exists(),
+        "root skill helper script should be installed"
+    );
+    assert!(
+        !dir.path().join(".claude/skills/content/SKILL.md").exists(),
+        "buggy fallback name should not be used"
+    );
+    assert!(
+        dir.path()
+            .join(".skillfile/cache/skills/book-to-skill/scripts/extract.py")
+            .exists(),
+        "cache should include helper scripts for root-directory skills"
+    );
+}
+
+#[test]
+#[serial]
 fn pin_then_unpin() {
     if !require_github_token() {
         return;
