@@ -7,8 +7,8 @@ use skillfile_core::models::{short_sha, ConflictState};
 use skillfile_core::parser::{find_entry_in, parse_manifest, MANIFEST_NAME};
 use skillfile_core::progress;
 use skillfile_deploy::paths::{installed_dir_files, installed_path};
-use skillfile_sources::strategy::is_dir_entry;
-use skillfile_sources::sync::{fetch_dir_at_sha, fetch_file_at_sha};
+use skillfile_sources::strategy::is_cached_dir_entry;
+use skillfile_sources::sync::{fetch_dir_at_sha, fetch_file_at_sha, vendor_dir_for};
 
 use crate::patch::{
     apply_patch_pure, dir_patch_path, generate_patch, has_patch, read_patch,
@@ -422,7 +422,8 @@ pub fn cmd_resolve(
         Some(c) => c,
     };
 
-    if is_dir_entry(entry) {
+    let vdir = vendor_dir_for(entry, repo_root);
+    if is_cached_dir_entry(entry, &vdir) {
         resolve_dir_entry(entry, &conflict, repo_root)
     } else {
         resolve_single_file(entry, &conflict, repo_root)

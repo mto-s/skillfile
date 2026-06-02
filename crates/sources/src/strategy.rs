@@ -63,6 +63,42 @@ pub fn is_dir_entry(entry: &Entry) -> bool {
     }
 }
 
+#[must_use]
+pub fn is_cached_dir_entry(entry: &Entry, vdir: &Path) -> bool {
+    if is_dir_entry(entry) {
+        return true;
+    }
+    match &entry.source {
+        SourceFields::Github { path_in_repo, .. } | SourceFields::Gitlab { path_in_repo, .. } => {
+            path_in_repo == "." && cache_has_auxiliary_files(vdir)
+        }
+        SourceFields::Local { .. } | SourceFields::Url { .. } => false,
+    }
+}
+
+fn cache_has_auxiliary_files(vdir: &Path) -> bool {
+    cache_has_auxiliary_files_from(vdir, vdir)
+}
+
+fn cache_has_auxiliary_files_from(root: &Path, dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+
+    entries.filter_map(std::result::Result::ok).any(|entry| {
+        let path = entry.path();
+        if path.file_name().is_some_and(|name| name == ".meta") {
+            return false;
+        }
+        if entry.file_type().is_ok_and(|ty| ty.is_dir()) {
+            return cache_has_auxiliary_files_from(root, &path);
+        }
+        path.strip_prefix(root)
+            .ok()
+            .is_some_and(|relative| relative != Path::new("SKILL.md"))
+    })
+}
+
 /// Return source-type-specific Skillfile fields (after source_type and entity_type).
 /// Used by `add` and `sort` commands.
 #[must_use]
@@ -183,6 +219,23 @@ mod tests {
     #[test]
     fn is_dir_entry_dot_path() {
         assert!(!is_dir_entry(&github_entry(".")));
+    }
+
+    #[test]
+    fn is_cached_dir_entry_root_skill_md_only_is_single_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("SKILL.md"), "# Root\n").unwrap();
+        assert!(!is_cached_dir_entry(&github_entry("."), dir.path()));
+    }
+
+    #[test]
+    fn is_cached_dir_entry_root_skill_with_auxiliary_files_is_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let scripts_dir = dir.path().join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+        std::fs::write(dir.path().join("SKILL.md"), "# Root\n").unwrap();
+        std::fs::write(scripts_dir.join("extract.py"), "print('ok')\n").unwrap();
+        assert!(is_cached_dir_entry(&github_entry("."), dir.path()));
     }
 
     #[test]

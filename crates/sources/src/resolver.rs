@@ -304,6 +304,15 @@ fn gitlab_tree_url(gl: &GitlabFetch<'_>, base_path: &str, page: usize) -> String
     )
 }
 
+fn gitlab_root_tree_url(gl: &GitlabFetch<'_>, page: usize) -> String {
+    let encoded_project = gl.owner_repo.replace('/', "%2F");
+    let encoded_ref = encode_query_value(gl.ref_);
+    format!(
+        "https://{}/api/v4/projects/{encoded_project}/repository/tree?ref={encoded_ref}&recursive=true&per_page={GITLAB_TREE_PAGE_SIZE}&page={page}",
+        gl.host
+    )
+}
+
 fn gitlab_tree_blob_entry(
     item: &serde_json::Value,
     prefix: &str,
@@ -318,6 +327,20 @@ fn gitlab_tree_blob_entry(
     Some(DirEntry {
         relative_path,
         download_url,
+    })
+}
+
+fn gitlab_root_blob_entry(item: &serde_json::Value, gl: &GitlabFetch<'_>) -> Option<DirEntry> {
+    if item["type"].as_str() != Some("blob") {
+        return None;
+    }
+    let path = item["path"].as_str()?;
+    if is_root_repo_meta_path(path) {
+        return None;
+    }
+    Some(DirEntry {
+        relative_path: path.to_string(),
+        download_url: gitlab_file_url(gl, path),
     })
 }
 
@@ -338,6 +361,10 @@ pub(crate) fn list_gitlab_dir_recursive(
     gl: &GitlabFetch<'_>,
     base_path: &str,
 ) -> Result<Vec<DirEntry>, SkillfileError> {
+    if base_path == "." {
+        return list_gitlab_root_dir_recursive(gl);
+    }
+
     let trimmed = base_path.trim_end_matches('/');
     let prefix = format!("{trimmed}/");
     let mut entries = Vec::new();
@@ -375,6 +402,37 @@ pub(crate) fn list_gitlab_dir_recursive(
     Ok(entries)
 }
 
+fn list_gitlab_root_dir_recursive(gl: &GitlabFetch<'_>) -> Result<Vec<DirEntry>, SkillfileError> {
+    let mut entries = Vec::new();
+    let mut page = 1;
+
+    loop {
+        let url = gitlab_root_tree_url(gl, page);
+        let Some(text) = gl.client.get_json(&url)? else {
+            break;
+        };
+        let items: Vec<serde_json::Value> = serde_json::from_str(&text)
+            .map_err(|e| SkillfileError::Network(format!("invalid GitLab tree JSON: {e}")))?;
+
+        if items.is_empty() {
+            break;
+        }
+
+        entries.extend(
+            items
+                .iter()
+                .filter_map(|item| gitlab_root_blob_entry(item, gl)),
+        );
+
+        if items.len() < GITLAB_TREE_PAGE_SIZE {
+            break;
+        }
+        page += 1;
+    }
+
+    Ok(entries)
+}
+
 // ---------------------------------------------------------------------------
 // list_repo_skill_entries — discover skill entry paths in a repo
 // ---------------------------------------------------------------------------
@@ -395,6 +453,29 @@ fn is_repo_meta_file(path: &str) -> bool {
         .iter()
         .any(|m| m.eq_ignore_ascii_case(filename))
         || path.to_ascii_lowercase().starts_with(".github/")
+}
+
+const ROOT_REPO_META_FILES: &[&str] = &[
+    ".gitattributes",
+    ".gitignore",
+    ".gitmodules",
+    "license",
+    "license.txt",
+];
+
+fn is_root_repo_meta_path(path: &str) -> bool {
+    if path.to_ascii_lowercase().starts_with(".github/") {
+        return true;
+    }
+    if path.contains('/') {
+        return false;
+    }
+    REPO_META_FILES
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(path))
+        || ROOT_REPO_META_FILES
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(path))
 }
 
 /// `SKILL.md` (case-insensitive) becomes `"."`, everything else stays as-is.
@@ -419,7 +500,7 @@ fn single_file_dir_entry(dir: &str, file_path: &str) -> String {
     }
 }
 
-/// - `SKILL.md` at repo root → `.`
+/// - `SKILL.md` at repo root → `.` and claims the whole repo
 /// - `dir/SKILL.md` (or multiple `.md` files in a dir) → `dir` (directory entry)
 /// - `path/to/file.md` (only `.md` file in its dir) → `path/to/file.md` (single file)
 ///
@@ -428,6 +509,12 @@ fn single_file_dir_entry(dir: &str, file_path: &str) -> String {
 /// entries. This handles arbitrarily nested repos (e.g. `skills/alice/python-pro/`
 /// with `SKILL.md` + `resources/playbook.md` produces ONE entry, not two).
 fn collapse_to_entries(md_files: &[String]) -> Vec<String> {
+    if md_files
+        .iter()
+        .any(|path| path.eq_ignore_ascii_case("SKILL.md"))
+    {
+        return vec![".".to_string()];
+    }
     let skill_roots = find_skill_roots(md_files);
     let unclaimed = find_unclaimed_files(md_files, &skill_roots);
 
@@ -634,6 +721,10 @@ pub(crate) fn list_github_dir_recursive(
     gh: &GithubFetch<'_>,
     base_path: &str,
 ) -> Result<Vec<DirEntry>, SkillfileError> {
+    if base_path == "." {
+        return list_github_root_dir_recursive(gh);
+    }
+
     let entries = list_dir_via_tree(gh, base_path)?;
     if !entries.is_empty() {
         return Ok(entries);
@@ -643,6 +734,45 @@ pub(crate) fn list_github_dir_recursive(
     // beyond the cutoff. Fall back to the Contents API which lists a
     // specific directory without truncation.
     list_dir_via_contents(gh, base_path)
+}
+
+fn list_github_root_dir_recursive(gh: &GithubFetch<'_>) -> Result<Vec<DirEntry>, SkillfileError> {
+    let url = format!(
+        "https://api.github.com/repos/{}/git/trees/{}?recursive=1",
+        gh.owner_repo, gh.ref_
+    );
+    let text = gh.client.get_json(&url)?.ok_or_else(|| {
+        SkillfileError::Network(format!(
+            "failed to list directory {}/.: 4xx error",
+            gh.owner_repo
+        ))
+    })?;
+    let data: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| SkillfileError::Network(format!("invalid tree JSON: {e}")))?;
+
+    let empty = Vec::new();
+    let tree = data["tree"].as_array().unwrap_or(&empty);
+
+    Ok(tree
+        .iter()
+        .filter_map(|item| {
+            if item["type"].as_str() != Some("blob") {
+                return None;
+            }
+            let path = item["path"].as_str()?;
+            if is_root_repo_meta_path(path) {
+                return None;
+            }
+            let encoded_path = encode_url_path(path);
+            Some(DirEntry {
+                relative_path: path.to_string(),
+                download_url: format!(
+                    "https://raw.githubusercontent.com/{}/{}/{}",
+                    gh.owner_repo, gh.ref_, encoded_path
+                ),
+            })
+        })
+        .collect())
 }
 
 /// List directory files via the recursive Tree API (fast, but truncates on huge repos).
@@ -1306,6 +1436,36 @@ mod tests {
     }
 
     #[test]
+    fn list_github_dir_recursive_root_filters_repo_meta_and_keeps_scripts() {
+        let owner_repo = "virgiliojr94/book-to-skill";
+        let ref_ = "master";
+        let url = tree_url(owner_repo, ref_);
+        let json = tree_json(&[
+            ("SKILL.md", "blob"),
+            ("README.md", "blob"),
+            ("LICENSE.md", "blob"),
+            (".gitignore", "blob"),
+            ("scripts/extract.py", "blob"),
+            (".github/workflows/ci.yml", "blob"),
+        ]);
+
+        let mut client = MockClient::new();
+        client.add_json(&url, &json);
+
+        let gh = GithubFetch {
+            client: &client,
+            owner_repo,
+            ref_,
+        };
+        let entries = list_github_dir_recursive(&gh, ".").unwrap();
+        let paths: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry.relative_path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["SKILL.md", "scripts/extract.py"]);
+    }
+
+    #[test]
     fn list_github_dir_recursive_download_urls_are_correct() {
         let owner_repo = "myorg/myrepo";
         let ref_ = "abc123sha";
@@ -1757,26 +1917,20 @@ mod tests {
     }
 
     #[test]
-    fn collapse_mixed_root_and_nested() {
+    fn collapse_root_skill_claims_nested_content() {
         let files = strs(&[
             "SKILL.md",
             "skills/git.md",
             "skills/docker/SKILL.md",
             "skills/docker/compose.md",
         ]);
-        let entries = collapse_to_entries(&files);
-        assert!(entries.contains(&".".to_string()));
-        assert!(entries.contains(&"skills/git.md".to_string()));
-        assert!(entries.contains(&"skills/docker".to_string()));
-        assert_eq!(entries.len(), 3);
+        assert_eq!(collapse_to_entries(&files), vec!["."]);
     }
 
     #[test]
-    fn collapse_multiple_root_files() {
+    fn collapse_root_skill_absorbs_root_markdown_siblings() {
         let files = strs(&["SKILL.md", "other.md"]);
-        let entries = collapse_to_entries(&files);
-        assert!(entries.contains(&".".to_string()));
-        assert!(entries.contains(&"other.md".to_string()));
+        assert_eq!(collapse_to_entries(&files), vec!["."]);
     }
 
     #[test]
@@ -1900,9 +2054,7 @@ mod tests {
         client.add_json(&url, &json);
 
         let entries = list_repo_skill_entries(&client, "org/repo");
-        assert!(entries.contains(&".".to_string()));
-        assert!(entries.contains(&"skills/git.md".to_string()));
-        assert_eq!(entries.len(), 2);
+        assert_eq!(entries, vec!["."]);
     }
 
     #[test]
@@ -2470,6 +2622,41 @@ mod tests {
         let paths: Vec<&str> = entries.iter().map(|e| e.relative_path.as_str()).collect();
         assert!(paths.contains(&"file1.md"));
         assert!(paths.contains(&"file2.md"));
+    }
+
+    #[test]
+    fn list_gitlab_dir_recursive_root_filters_repo_meta_and_keeps_scripts() {
+        let owner_repo = "group/project";
+        let ref_ = "main";
+        let encoded = owner_repo.replace('/', "%2F");
+        let encoded_ref = encode_query_value(ref_);
+        let url = format!(
+            "https://gitlab.com/api/v4/projects/{encoded}/repository/tree?ref={encoded_ref}&recursive=true&per_page=100&page=1"
+        );
+        let json = serde_json::json!([
+            {"path": "SKILL.md", "type": "blob"},
+            {"path": "README.md", "type": "blob"},
+            {"path": "scripts/extract.py", "type": "blob"},
+            {"path": ".github/workflows/ci.yml", "type": "blob"},
+            {"path": ".gitignore", "type": "blob"}
+        ])
+        .to_string();
+
+        let mut client = MockClient::new();
+        client.add_json(&url, &json);
+
+        let gl = GitlabFetch {
+            client: &client,
+            owner_repo,
+            ref_,
+            host: "gitlab.com",
+        };
+        let entries = list_gitlab_dir_recursive(&gl, ".").unwrap();
+        let paths: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry.relative_path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["SKILL.md", "scripts/extract.py"]);
     }
 
     #[test]

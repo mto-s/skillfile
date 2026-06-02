@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use skillfile_core::error::SkillfileError;
 use skillfile_core::models::{EntityType, Entry, Manifest, SourceFields};
-use skillfile_sources::strategy::{content_file, is_dir_entry};
+use skillfile_sources::strategy::{content_file, is_cached_dir_entry};
 use skillfile_sources::sync::vendor_dir_for;
 
 use crate::adapter::{adapters, AdapterScope, PlatformAdapter};
@@ -101,7 +101,7 @@ pub fn source_path(entry: &Entry, repo_root: &Path) -> Option<PathBuf> {
 
 fn source_path_remote(entry: &Entry, repo_root: &Path) -> Option<PathBuf> {
     let vdir = vendor_dir_for(entry, repo_root);
-    if is_dir_entry(entry) {
+    if is_cached_dir_entry(entry, &vdir) {
         vdir.exists().then_some(vdir)
     } else {
         let filename = content_file(entry);

@@ -16,7 +16,7 @@ use skillfile_core::patch::{
     read_patch, remove_dir_patch, remove_patch, walkdir, write_dir_patch, write_patch,
 };
 use skillfile_core::progress;
-use skillfile_sources::strategy::{content_file, is_dir_entry};
+use skillfile_sources::strategy::{content_file, is_cached_dir_entry, is_dir_entry};
 use skillfile_sources::sync::{cmd_sync, vendor_dir_for};
 
 use crate::adapter::{adapters, AdapterScope, DeployRequest, DirInstallMode, PlatformAdapter};
@@ -289,7 +289,7 @@ fn auto_pin_entry(
 
     let vdir = vendor_dir_for(entry, repo_root);
 
-    if is_dir_entry(entry) {
+    if is_cached_dir_entry(entry, &vdir) {
         return auto_pin_dir_entry(entry, manifest, repo_root);
     }
 
