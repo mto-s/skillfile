@@ -835,6 +835,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn nested_skill_entry() -> Entry {
         Entry {
             entity_type: EntityType::Skill,
@@ -847,6 +848,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn deploy_dir(source: &Path, root: &Path, overwrite: bool) -> DeployResult {
         adapters()
             .get("claude-code")
@@ -863,6 +865,7 @@ mod tests {
             })
     }
 
+    #[cfg(unix)]
     fn create_dir_when(path: &Path, create: bool) {
         if create {
             std::fs::create_dir_all(path).unwrap();
