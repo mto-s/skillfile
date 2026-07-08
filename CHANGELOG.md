@@ -4,6 +4,20 @@ All notable changes to skillfile are documented here.
 
 ---
 
+## v1.7.2 - 08-07-2026
+
+### Fixed
+
+- **`skillfile install` now keeps deploying healthy entries even when another upstream entry fails** - sync preserves successful SHA resolutions, cache fetches, and lock updates, then installs the valid cached entries before returning the upstream error instead of stopping the whole run early.
+- **Incomplete directory caches are no longer treated as valid installs** - staged cache replacement now publishes remote directory updates only after content and metadata are complete, which prevents metadata-only or partially written caches from being deployed as if they were healthy.
+- **Missing upstream directories now fail explicitly instead of looking like empty content** - GitHub and GitLab directory fetches now surface invalid or missing manifest paths as errors, rather than accepting an empty result and exiting successfully.
+- **Existing installed skill directories now pick up newly added upstream files without overwriting local edits** - nested installs fill in missing files such as helper scripts while leaving already edited files in place.
+- **Directory deployment is hardened against symlink traversal** - source and destination symlinks are now rejected across fresh installs, overwrite installs, and merge-style installs.
+
+### Changed
+
+- **Dependency refresh** - bumped `console` to 0.16.4, `similar` to 3.1.1, `insta` to 1.48.0, and `serial_test` to 3.5.0.
+
 ## v1.7.1 - 02-06-2026
 
 ### Fixed
