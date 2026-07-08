@@ -1275,12 +1275,12 @@ pub fn cmd_install(repo_root: &Path, opts: &CmdInstallOpts<'_>) -> Result<(), Sk
     }
 
     // Fetch any missing or stale entries.
-    cmd_sync(&skillfile_sources::sync::SyncCmdOpts {
+    let sync_result = cmd_sync(&skillfile_sources::sync::SyncCmdOpts {
         repo_root,
         dry_run: opts.dry_run,
         entry_filter: None,
         update: opts.update,
-    })?;
+    });
 
     // Read new locked state (written by sync).
     let locked = read_lock(repo_root).unwrap_or_default();
@@ -1299,6 +1299,7 @@ pub fn cmd_install(repo_root: &Path, opts: &CmdInstallOpts<'_>) -> Result<(), Sk
         },
     };
     deploy_all(&manifest, &deploy_ctx)?;
+    sync_result?;
 
     if !opts.dry_run {
         progress!("Done.");
@@ -1569,6 +1570,7 @@ mod tests {
         std::fs::create_dir_all(&vdir).unwrap();
         std::fs::write(vdir.join("SKILL.md"), "# Python Pro").unwrap();
         std::fs::write(vdir.join("examples.md"), "# Examples").unwrap();
+        std::fs::write(vdir.join(".meta"), r#"{"sha":"cached"}"#).unwrap();
 
         let entry = Entry {
             entity_type: EntityType::Skill,
@@ -1605,7 +1607,7 @@ mod tests {
         std::fs::create_dir_all(&vdir).unwrap();
         std::fs::write(vdir.join("backend-developer.md"), "# Backend").unwrap();
         std::fs::write(vdir.join("frontend-developer.md"), "# Frontend").unwrap();
-        std::fs::write(vdir.join(".meta"), "{}").unwrap();
+        std::fs::write(vdir.join(".meta"), r#"{"sha":"cached"}"#).unwrap();
 
         let entry = Entry {
             entity_type: EntityType::Agent,
@@ -2766,6 +2768,7 @@ mod tests {
         let vdir = dir.path().join(format!(".skillfile/cache/skills/{name}"));
         std::fs::create_dir_all(&vdir).unwrap();
         std::fs::write(vdir.join("SKILL.md"), "# Lang Pro\n\nOriginal.\n").unwrap();
+        std::fs::write(vdir.join(".meta"), r#"{"sha":"cached"}"#).unwrap();
         std::fs::write(vdir.join("examples.md"), "# Examples\n\nOriginal.\n").unwrap();
 
         // Installed dir (nested mode for skills).
@@ -2819,6 +2822,7 @@ mod tests {
         let vdir = dir.path().join(format!(".skillfile/cache/skills/{name}"));
         std::fs::create_dir_all(&vdir).unwrap();
         std::fs::write(vdir.join("SKILL.md"), "# Lang Pro\n\nOriginal.\n").unwrap();
+        std::fs::write(vdir.join(".meta"), r#"{"sha":"cached"}"#).unwrap();
 
         let first_inst_dir = dir.path().join(format!(".claude/skills/{name}"));
         std::fs::create_dir_all(&first_inst_dir).unwrap();

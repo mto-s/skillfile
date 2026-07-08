@@ -193,6 +193,12 @@ impl PlatformAdapter for FileSystemAdapter {
             self.single_file_install_path(req.entry, &target_dir)
         };
 
+        let dest_is_real_dir = std::fs::symlink_metadata(&dest)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink());
+        if is_dir && dest_is_real_dir && !req.opts.overwrite && !req.opts.dry_run {
+            return copy_missing_dir(req.source, &dest, req.source).unwrap_or_default();
+        }
+
         if !place_file(
             &PlaceOp {
                 source: req.source,
@@ -442,11 +448,100 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         let entry = entry?;
         let ty = entry.file_type()?;
         let dest_path = dst.join(entry.file_name());
-        if ty.is_dir() {
+        if ty.is_symlink() {
+            return Err(symlink_error(&entry.path()));
+        } else if ty.is_dir() {
             copy_dir_recursive(&entry.path(), &dest_path)?;
-        } else {
+        } else if ty.is_file() {
             std::fs::copy(entry.path(), &dest_path)?;
+        } else {
+            return Err(symlink_error(&entry.path()));
         }
+    }
+    Ok(())
+}
+
+fn copy_missing_dir(
+    source_dir: &Path,
+    target_dir: &Path,
+    source_root: &Path,
+) -> std::io::Result<DeployResult> {
+    require_real_dir(source_dir)?;
+    ensure_real_dir(target_dir)?;
+    let mut installed = HashMap::new();
+    for entry in std::fs::read_dir(source_dir)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(symlink_error(&entry.path()));
+        }
+        let source_path = entry.path();
+        let target_path = target_dir.join(entry.file_name());
+        if file_type.is_dir() {
+            installed.extend(copy_missing_dir(&source_path, &target_path, source_root)?);
+            continue;
+        }
+        match std::fs::symlink_metadata(&target_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(symlink_error(&target_path));
+            }
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        copy_file_create_new(&source_path, &target_path)?;
+        progress!(
+            "  {} -> {}",
+            entry.file_name().to_string_lossy(),
+            target_path.display()
+        );
+        if entry.file_name() == ".meta" {
+            continue;
+        }
+        if let Ok(relative) = source_path.strip_prefix(source_root) {
+            installed.insert(forward_slash(relative), target_path);
+        }
+    }
+    Ok(installed)
+}
+
+fn require_real_dir(path: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    Err(symlink_error(path))
+}
+
+fn ensure_real_dir(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => Err(symlink_error(path)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(path),
+        Err(error) => Err(error),
+    }
+}
+
+fn symlink_error(path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "refusing to traverse symlink or non-directory: {}",
+            path.display()
+        ),
+    )
+}
+
+fn copy_file_create_new(source: &Path, target: &Path) -> std::io::Result<()> {
+    let mut source_file = std::fs::File::open(source)?;
+    let mut target_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)?;
+    if let Err(error) = std::io::copy(&mut source_file, &mut target_file) {
+        drop(target_file);
+        let _ = std::fs::remove_file(target);
+        return Err(error);
     }
     Ok(())
 }
@@ -737,6 +832,40 @@ mod tests {
         AdapterScope {
             scope: Scope::Global,
             repo_root: root,
+        }
+    }
+
+    fn nested_skill_entry() -> Entry {
+        Entry {
+            entity_type: EntityType::Skill,
+            name: "my-skill".into(),
+            source: skillfile_core::models::SourceFields::Github {
+                owner_repo: "o/r".into(),
+                path_in_repo: "skills/my-skill".into(),
+                ref_: "main".into(),
+            },
+        }
+    }
+
+    fn deploy_dir(source: &Path, root: &Path, overwrite: bool) -> DeployResult {
+        adapters()
+            .get("claude-code")
+            .unwrap()
+            .deploy_entry(&DeployRequest {
+                entry: &nested_skill_entry(),
+                source,
+                scope: Scope::Local,
+                repo_root: root,
+                opts: &InstallOptions {
+                    dry_run: false,
+                    overwrite,
+                },
+            })
+    }
+
+    fn create_dir_when(path: &Path, create: bool) {
+        if create {
+            std::fs::create_dir_all(path).unwrap();
         }
     }
 
@@ -1292,7 +1421,7 @@ mod tests {
     // -- place_file skip logic --
 
     #[test]
-    fn place_file_skips_existing_dir_when_no_overwrite() {
+    fn deploy_entry_adds_missing_file_to_existing_dir_without_overwrite() {
         use skillfile_core::models::{EntityType, SourceFields};
 
         let dir = tempfile::tempdir().unwrap();
@@ -1325,10 +1454,97 @@ mod tests {
                 overwrite: false,
             },
         });
-        // Should skip — dir already exists
-        assert!(result.is_empty());
-        // Old file still there
+        assert_eq!(result.len(), 1);
+        assert!(result.contains_key("SKILL.md"));
+        assert_eq!(
+            std::fs::read_to_string(dest.join("SKILL.md")).unwrap(),
+            "# Skill"
+        );
         assert!(dest.join("OLD.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_entry_does_not_follow_symlinked_destination_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join(".skillfile/cache/skills/my-skill");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("SKILL.md"), "# Skill").unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let dest = dir.path().join(".claude/skills/my-skill");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        symlink(&outside, &dest).unwrap();
+
+        let result = deploy_dir(&source, dir.path(), false);
+
+        assert!(result.is_empty());
+        assert!(!outside.join("SKILL.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_entry_does_not_follow_symlinked_destination_component() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join(".skillfile/cache/skills/my-skill");
+        std::fs::create_dir_all(source.join("scripts")).unwrap();
+        std::fs::write(source.join("scripts/tool.py"), "pass\n").unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let dest = dir.path().join(".claude/skills/my-skill");
+        std::fs::create_dir_all(&dest).unwrap();
+        symlink(&outside, dest.join("scripts")).unwrap();
+
+        let result = deploy_dir(&source, dir.path(), false);
+
+        assert!(result.is_empty());
+        assert!(!outside.join("tool.py").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_entry_does_not_follow_source_symlink_on_fresh_or_overwrite_install() {
+        use std::os::unix::fs::symlink;
+
+        for overwrite in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join(".skillfile/cache/skills/my-skill");
+            std::fs::create_dir_all(&source).unwrap();
+            let outside = dir.path().join("outside.md");
+            std::fs::write(&outside, "# Outside\n").unwrap();
+            symlink(&outside, source.join("SKILL.md")).unwrap();
+            let dest = dir.path().join(".claude/skills/my-skill");
+            create_dir_when(&dest, overwrite);
+
+            let result = deploy_dir(&source, dir.path(), overwrite);
+
+            assert!(result.is_empty());
+            assert!(!dest.join("SKILL.md").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deploy_entry_does_not_follow_dangling_destination_file_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join(".skillfile/cache/skills/my-skill");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("SKILL.md"), "# Skill\n").unwrap();
+        let outside = dir.path().join("outside.md");
+        let dest = dir.path().join(".claude/skills/my-skill");
+        std::fs::create_dir_all(&dest).unwrap();
+        symlink(&outside, dest.join("SKILL.md")).unwrap();
+
+        let result = deploy_dir(&source, dir.path(), false);
+
+        assert!(result.is_empty());
+        assert!(!outside.exists());
     }
 
     #[test]

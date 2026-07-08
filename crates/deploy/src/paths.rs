@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 
 use skillfile_core::error::SkillfileError;
 use skillfile_core::models::{EntityType, Entry, Manifest, SourceFields};
-use skillfile_sources::strategy::{content_file, is_cached_dir_entry};
+use skillfile_core::patch::walkdir;
+use skillfile_sources::strategy::{content_file, is_cached_dir_entry, meta_sha};
 use skillfile_sources::sync::vendor_dir_for;
 
 use crate::adapter::{adapters, AdapterScope, PlatformAdapter};
@@ -102,10 +103,30 @@ pub fn source_path(entry: &Entry, repo_root: &Path) -> Option<PathBuf> {
 fn source_path_remote(entry: &Entry, repo_root: &Path) -> Option<PathBuf> {
     let vdir = vendor_dir_for(entry, repo_root);
     if is_cached_dir_entry(entry, &vdir) {
-        vdir.exists().then_some(vdir)
+        remote_dir_cache_is_complete(entry, &vdir).then_some(vdir)
     } else {
         let filename = content_file(entry);
         (!filename.is_empty()).then(|| vdir.join(filename))
+    }
+}
+
+fn remote_dir_cache_is_complete(entry: &Entry, vdir: &Path) -> bool {
+    if meta_sha(vdir).is_none() {
+        return false;
+    }
+    match entry.entity_type {
+        EntityType::Skill => std::fs::read_dir(vdir).is_ok_and(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                entry.file_type().is_ok_and(|kind| kind.is_file())
+                    && entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("SKILL.md"))
+            })
+        }),
+        EntityType::Agent => walkdir(vdir)
+            .into_iter()
+            .any(|path| path.extension().is_some_and(|extension| extension == "md")),
     }
 }
 
@@ -403,6 +424,58 @@ mod tests {
 
         let result = source_path(&entry, tmp.path());
         assert_eq!(result, Some(vdir.join("test.md")));
+    }
+
+    #[test]
+    fn source_path_remote_dir_requires_cached_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let entry = Entry {
+            entity_type: EntityType::Skill,
+            name: "test".into(),
+            source: SourceFields::Github {
+                owner_repo: "o/r".into(),
+                path_in_repo: "skills/test".into(),
+                ref_: "main".into(),
+            },
+        };
+        let vdir = tmp.path().join(".skillfile/cache/skills/test");
+        std::fs::create_dir_all(&vdir).unwrap();
+        std::fs::create_dir_all(vdir.join("scripts")).unwrap();
+        std::fs::write(vdir.join("scripts/helper.py"), "pass\n").unwrap();
+
+        assert_eq!(source_path(&entry, tmp.path()), None);
+
+        std::fs::write(vdir.join(".meta"), r#"{"sha":"abc123"}"#).unwrap();
+        assert_eq!(source_path(&entry, tmp.path()), None);
+
+        std::fs::write(vdir.join("skill.md"), "# Test\n").unwrap();
+        assert_eq!(source_path(&entry, tmp.path()), Some(vdir));
+    }
+
+    #[test]
+    fn source_path_remote_agent_dir_requires_metadata_and_markdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let entry = Entry {
+            entity_type: EntityType::Agent,
+            name: "agents".into(),
+            source: SourceFields::Github {
+                owner_repo: "o/r".into(),
+                path_in_repo: "agents".into(),
+                ref_: "main".into(),
+            },
+        };
+        let vdir = tmp.path().join(".skillfile/cache/agents/agents");
+        std::fs::create_dir_all(vdir.join("nested")).unwrap();
+        std::fs::write(vdir.join("nested/helper.py"), "pass\n").unwrap();
+
+        assert_eq!(source_path(&entry, tmp.path()), None);
+
+        std::fs::write(vdir.join(".meta"), r#"{"sha":"abc123"}"#).unwrap();
+        assert_eq!(source_path(&entry, tmp.path()), None);
+
+        std::fs::write(vdir.join("nested/agent.md"), "# Agent\n").unwrap();
+
+        assert_eq!(source_path(&entry, tmp.path()), Some(vdir));
     }
 
     #[test]
