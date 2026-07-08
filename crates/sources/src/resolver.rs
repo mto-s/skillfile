@@ -833,9 +833,12 @@ fn list_dir_via_contents(
         "https://api.github.com/repos/{}/contents/{}?ref={}",
         gh.owner_repo, encoded, gh.ref_
     );
-    let Some(text) = gh.client.get_json(&url)? else {
-        return Ok(Vec::new());
-    };
+    let text = gh.client.get_json(&url)?.ok_or_else(|| {
+        SkillfileError::Network(format!(
+            "failed to list directory {}/{base_path}: 4xx error",
+            gh.owner_repo
+        ))
+    })?;
     let items: Vec<serde_json::Value> = serde_json::from_str(&text)
         .map_err(|e| SkillfileError::Network(format!("invalid contents JSON: {e}")))?;
 
@@ -1546,7 +1549,7 @@ mod tests {
     }
 
     #[test]
-    fn list_github_dir_recursive_empty_tree_and_empty_contents() {
+    fn list_github_dir_recursive_missing_contents_path_errors() {
         let owner_repo = "org/repo";
         let ref_ = "main";
 
@@ -1562,8 +1565,8 @@ mod tests {
             owner_repo,
             ref_,
         };
-        let entries = list_github_dir_recursive(&gh, "agents/dir").unwrap();
-        assert!(entries.is_empty());
+        let error = list_github_dir_recursive(&gh, "agents/dir").unwrap_err();
+        assert!(error.to_string().contains("failed to list directory"));
     }
 
     #[test]

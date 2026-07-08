@@ -250,3 +250,74 @@ fn install_unknown_platform_skips_gracefully() {
         "no conflict file must be written for unknown adapter"
     );
 }
+
+#[test]
+fn install_update_deploys_valid_cache_and_preserves_install_for_empty_cache() {
+    let dirs = Dirs::new();
+    let root = dirs.path();
+    std::fs::write(
+        root.join("Skillfile"),
+        "github skill my-skill owner/repo skills/my-skill\n\
+         github skill good-skill owner/repo skills/good-skill\n\
+         install claude-code local\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join(".skillfile/cache/skills/my-skill")).unwrap();
+    let good_cache = root.join(".skillfile/cache/skills/good-skill");
+    std::fs::create_dir_all(&good_cache).unwrap();
+    std::fs::write(good_cache.join("SKILL.md"), "# Deploy cached skill\n").unwrap();
+    std::fs::write(good_cache.join(".meta"), r#"{"sha":"cached"}"#).unwrap();
+    let installed = root.join(".claude/skills/my-skill/SKILL.md");
+    std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+    std::fs::write(&installed, "# Keep existing install\n").unwrap();
+    std::fs::write(root.join("Skillfile.lock"), "not valid json").unwrap();
+
+    let error = cmd_install(
+        root,
+        &CmdInstallOpts {
+            dry_run: false,
+            update: true,
+            extra_targets: None,
+        },
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("lock"));
+    assert_eq!(
+        std::fs::read_to_string(installed).unwrap(),
+        "# Keep existing install\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join(".claude/skills/good-skill/SKILL.md")).unwrap(),
+        "# Deploy cached skill\n"
+    );
+}
+
+#[test]
+fn install_adds_missing_nested_files_without_overwriting_existing_files() {
+    let dirs = Dirs::new();
+    let root = dirs.path();
+    std::fs::write(
+        root.join("Skillfile"),
+        "local skill my-skill skills/my-skill\ninstall claude-code local\n",
+    )
+    .unwrap();
+    let source = root.join("skills/my-skill");
+    std::fs::create_dir_all(source.join("scripts")).unwrap();
+    std::fs::write(source.join("SKILL.md"), "# Upstream\n").unwrap();
+    std::fs::write(source.join("scripts/new.py"), "print('new')\n").unwrap();
+    let installed = root.join(".claude/skills/my-skill");
+    std::fs::create_dir_all(&installed).unwrap();
+    std::fs::write(installed.join("SKILL.md"), "# Local edit\n").unwrap();
+
+    cmd_install(root, &default_opts()).unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(installed.join("SKILL.md")).unwrap(),
+        "# Local edit\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(installed.join("scripts/new.py")).unwrap(),
+        "print('new')\n"
+    );
+}

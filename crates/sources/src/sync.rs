@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use skillfile_core::error::SkillfileError;
 use skillfile_core::lock::{lock_key, read_lock, write_lock};
@@ -16,6 +17,76 @@ use crate::resolver::{
 use crate::strategy::{content_file, is_cached_dir_entry, is_dir_entry, meta_sha};
 
 pub const VENDOR_DIR: &str = ".skillfile/cache";
+static CACHE_TX_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn cache_transaction_path(vdir: &Path, role: &str) -> PathBuf {
+    let sequence = CACHE_TX_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = vdir.file_name().unwrap_or_default().to_string_lossy();
+    vdir.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".{name}.{role}-{}-{sequence}", std::process::id()))
+}
+
+fn remove_cache_path(path: &Path) -> std::io::Result<()> {
+    if path.is_dir() && !path.is_symlink() {
+        std::fs::remove_dir_all(path)
+    } else if path.exists() || path.is_symlink() {
+        std::fs::remove_file(path)
+    } else {
+        Ok(())
+    }
+}
+
+fn restore_cache_after_publish_failure(
+    backup: &Path,
+    vdir: &Path,
+    publish_error: &std::io::Error,
+) -> Result<(), SkillfileError> {
+    std::fs::rename(backup, vdir).map_err(|rollback_error| {
+        SkillfileError::Install(format!(
+            "failed to publish cache: {publish_error}; rollback failed: {rollback_error}"
+        ))
+    })
+}
+
+fn publish_staged_cache(staging: &Path, vdir: &Path) -> Result<(), SkillfileError> {
+    let backup = cache_transaction_path(vdir, "backup");
+    let had_cache = vdir.exists() || vdir.is_symlink();
+    if had_cache {
+        std::fs::rename(vdir, &backup)?;
+    }
+    if let Err(publish_error) = std::fs::rename(staging, vdir) {
+        if had_cache {
+            restore_cache_after_publish_failure(&backup, vdir, &publish_error)?;
+        }
+        return Err(publish_error.into());
+    }
+    if had_cache {
+        remove_cache_path(&backup)?;
+    }
+    Ok(())
+}
+
+fn replace_cache_transactionally<T>(
+    vdir: &Path,
+    write: impl FnOnce(&Path) -> Result<T, SkillfileError>,
+) -> Result<T, SkillfileError> {
+    let staging = cache_transaction_path(vdir, "staging");
+    std::fs::create_dir_all(vdir.parent().unwrap_or_else(|| Path::new(".")))?;
+    std::fs::create_dir(&staging)?;
+    let value = match write(&staging) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = remove_cache_path(&staging);
+            return Err(error);
+        }
+    };
+    if let Err(error) = publish_staged_cache(&staging, vdir) {
+        let _ = remove_cache_path(&staging);
+        return Err(error);
+    }
+    Ok(value)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ForgeType {
@@ -179,6 +250,7 @@ struct FetchOp<'a> {
     client: &'a dyn HttpClient,
     gh: &'a GithubRef<'a>,
     vdir: &'a Path,
+    display_vdir: &'a Path,
     label: &'a str,
 }
 
@@ -247,6 +319,7 @@ fn write_github_dir(op: &FetchOp<'_>) -> Result<String, SkillfileError> {
             sha,
         },
         vdir: _,
+        display_vdir: _,
         label: _,
     } = op;
     let ghf = GithubFetch {
@@ -270,14 +343,20 @@ fn write_github_dir_entries(
             sha,
         },
         vdir,
+        display_vdir,
         label,
     } = op;
+    if dir_entries.is_empty() {
+        return Err(SkillfileError::Install(format!(
+            "directory {owner_repo}/{path_in_repo} contains no files"
+        )));
+    }
     let fetched = fetch_files_parallel(*client, dir_entries)?;
     write_fetched_dir(vdir, &fetched)?;
     progress!(
         "{label}: sha={} -> {}/ ({} files)",
         short_sha(sha),
-        vdir.display(),
+        display_vdir.display(),
         fetched.len()
     );
     Ok(github_dir_raw_url(owner_repo, path_in_repo, sha))
@@ -314,6 +393,7 @@ fn write_github_file(op: &FetchOp<'_>) -> Result<String, SkillfileError> {
             sha,
         },
         vdir,
+        display_vdir,
         label,
     } = op;
     let ghf = GithubFetch {
@@ -333,7 +413,11 @@ fn write_github_file(op: &FetchOp<'_>) -> Result<String, SkillfileError> {
         .unwrap_or("content.md");
     let dest = vdir.join(filename);
     std::fs::write(&dest, &content)?;
-    progress!("{label}: sha={} -> {}", short_sha(sha), dest.display());
+    progress!(
+        "{label}: sha={} -> {}",
+        short_sha(sha),
+        display_vdir.join(filename).display()
+    );
     Ok(format!(
         "https://raw.githubusercontent.com/{owner_repo}/{sha}/{effective_path}"
     ))
@@ -492,22 +576,25 @@ fn fetch_store_github(op: &StoreOp<'_>) -> Result<String, SkillfileError> {
         path_in_repo,
         sha,
     };
-    let fetch_op = FetchOp {
-        client: *client,
-        gh: &gh,
-        vdir,
-        label,
-    };
-    let raw_url = fetch_and_write_github(&fetch_op, is_dir_entry(entry))?;
-    write_github_meta(&GithubMeta {
-        vdir,
-        owner_repo,
-        path_in_repo,
-        ref_,
-        sha,
-        raw_url: &raw_url,
-    })?;
-    Ok(raw_url)
+    replace_cache_transactionally(vdir, |staging| {
+        let fetch_op = FetchOp {
+            client: *client,
+            gh: &gh,
+            vdir: staging,
+            display_vdir: vdir,
+            label,
+        };
+        let raw_url = fetch_and_write_github(&fetch_op, is_dir_entry(entry))?;
+        write_github_meta(&GithubMeta {
+            vdir: staging,
+            owner_repo,
+            path_in_repo,
+            ref_,
+            sha,
+            raw_url: &raw_url,
+        })?;
+        Ok(raw_url)
+    })
 }
 
 /// `sha_cache` maps a forge-qualified remote ref to its resolved SHA.
@@ -591,6 +678,7 @@ struct GitlabFetchOp<'a> {
     client: &'a dyn HttpClient,
     gl: &'a GitlabRef<'a>,
     vdir: &'a Path,
+    display_vdir: &'a Path,
     label: &'a str,
 }
 
@@ -621,6 +709,7 @@ fn write_gitlab_dir(op: &GitlabFetchOp<'_>) -> Result<String, SkillfileError> {
                 host,
             },
         vdir: _,
+        display_vdir: _,
         label: _,
     } = op;
     let glf = GitlabFetch {
@@ -647,14 +736,20 @@ fn write_gitlab_dir_entries(
                 host,
             },
         vdir,
+        display_vdir,
         label,
     } = op;
+    if dir_entries.is_empty() {
+        return Err(SkillfileError::Install(format!(
+            "directory {owner_repo}/{path_in_repo} contains no files"
+        )));
+    }
     let fetched = fetch_files_parallel(*client, dir_entries)?;
     write_fetched_dir(vdir, &fetched)?;
     progress!(
         "{label}: sha={} -> {}/ ({} files)",
         short_sha(sha),
-        vdir.display(),
+        display_vdir.display(),
         fetched.len()
     );
     Ok(gitlab_dir_raw_url(&GitlabRef {
@@ -699,6 +794,7 @@ fn write_gitlab_file(op: &GitlabFetchOp<'_>) -> Result<String, SkillfileError> {
                 host,
             },
         vdir,
+        display_vdir,
         label,
     } = op;
     let glf = GitlabFetch {
@@ -719,7 +815,11 @@ fn write_gitlab_file(op: &GitlabFetchOp<'_>) -> Result<String, SkillfileError> {
         .unwrap_or("content.md");
     let dest = vdir.join(filename);
     std::fs::write(&dest, &content)?;
-    progress!("{label}: sha={} -> {}", short_sha(sha), dest.display());
+    progress!(
+        "{label}: sha={} -> {}",
+        short_sha(sha),
+        display_vdir.join(filename).display()
+    );
     let encoded_project = owner_repo.replace('/', "%2F");
     let encoded_path = effective_path.replace('/', "%2F");
     Ok(format!(
@@ -805,23 +905,26 @@ fn fetch_store_gitlab(op: &GitlabStoreOp<'_>) -> Result<String, SkillfileError> 
         sha,
         host,
     };
-    let fetch_op = GitlabFetchOp {
-        client: *client,
-        gl: &gl,
-        vdir,
-        label,
-    };
-    let raw_url = fetch_and_write_gitlab(&fetch_op, is_dir_entry(entry))?;
-    write_gitlab_meta(&GitlabMeta {
-        vdir,
-        owner_repo,
-        path_in_repo,
-        ref_,
-        sha,
-        raw_url: &raw_url,
-        host,
-    })?;
-    Ok(raw_url)
+    replace_cache_transactionally(vdir, |staging| {
+        let fetch_op = GitlabFetchOp {
+            client: *client,
+            gl: &gl,
+            vdir: staging,
+            display_vdir: vdir,
+            label,
+        };
+        let raw_url = fetch_and_write_gitlab(&fetch_op, is_dir_entry(entry))?;
+        write_gitlab_meta(&GitlabMeta {
+            vdir: staging,
+            owner_repo,
+            path_in_repo,
+            ref_,
+            sha,
+            raw_url: &raw_url,
+            host,
+        })?;
+        Ok(raw_url)
+    })
 }
 
 /// Core sync logic for a GitLab entry. Mirrors `sync_github_core`.
@@ -1064,11 +1167,11 @@ impl PendingResolve {
 fn resolve_shas_parallel(
     client: &dyn HttpClient,
     ctx: &ResolveCtx<'_>,
-) -> Result<HashMap<RemoteRefKey, String>, SkillfileError> {
+) -> HashMap<RemoteRefKey, String> {
     let keys = collect_pairs_to_resolve(ctx.entries, ctx.locked, ctx.update);
 
     if keys.is_empty() {
-        return Ok(HashMap::new());
+        return HashMap::new();
     }
 
     let pending: Vec<PendingResolve> = keys.into_iter().map(|key| PendingResolve { key }).collect();
@@ -1087,7 +1190,9 @@ fn resolve_shas_parallel(
 
     let mut cache = HashMap::with_capacity(results.len());
     for (p, result) in pending.into_iter().zip(results) {
-        let sha = result?;
+        let Ok(sha) = result else {
+            continue;
+        };
         progress!(
             "  resolved {}@{} -> {}",
             p.key.owner_repo,
@@ -1096,11 +1201,11 @@ fn resolve_shas_parallel(
         );
         cache.insert(p.key, sha);
     }
-    Ok(cache)
+    cache
 }
 
 struct SyncJob<'a> {
-    client: &'a UreqClient,
+    client: &'a dyn HttpClient,
     repo_root: &'a Path,
     entries: &'a [&'a Entry],
     dry_run: bool,
@@ -1203,6 +1308,25 @@ fn run_sequential_sync(job: SyncJob<'_>) -> Result<(), SkillfileError> {
     Ok(())
 }
 
+fn merge_sync_results(
+    results: Vec<Result<Option<(String, LockEntry)>, SkillfileError>>,
+    locked: &mut BTreeMap<String, LockEntry>,
+) -> Option<SkillfileError> {
+    let mut first_error = None;
+    for result in results {
+        match result {
+            Ok(Some((key, entry))) => {
+                locked.insert(key, entry);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    first_error
+}
+
 /// Execute sync in parallel using two-phase SHA resolution then fetch.
 fn run_parallel_sync(job: SyncJob<'_>) -> Result<(), SkillfileError> {
     let SyncJob {
@@ -1220,7 +1344,7 @@ fn run_parallel_sync(job: SyncJob<'_>) -> Result<(), SkillfileError> {
         locked: &locked,
         update,
     };
-    let sha_cache = resolve_shas_parallel(client, &resolve_ctx)?;
+    let sha_cache = resolve_shas_parallel(client, &resolve_ctx);
 
     // Phase 2: Sync all entries in parallel
     let params = SyncParams {
@@ -1242,15 +1366,15 @@ fn run_parallel_sync(job: SyncJob<'_>) -> Result<(), SkillfileError> {
                 .collect()
         });
 
-    // Merge results into locked map
-    for result in results {
-        if let Some((key, le)) = result? {
-            locked.insert(key, le);
-        }
-    }
+    let sync_error = merge_sync_results(results, &mut locked);
 
     if !dry_run {
         write_lock(repo_root, &locked)?;
+    }
+    if let Some(error) = sync_error {
+        return Err(error);
+    }
+    if !dry_run {
         progress!("Done.");
     }
 
@@ -1365,9 +1489,68 @@ mod tests {
     use crate::http::HttpClient;
 
     use super::{
-        content_exists, fetch_dir_at_sha, fetch_file_at_sha, resolve_shas_parallel, sync_entry,
-        vendor_dir_for, ForgeType, RemoteRefKey, ResolveCtx, SyncContext, VENDOR_DIR,
+        content_exists, fetch_dir_at_sha, fetch_file_at_sha, replace_cache_transactionally,
+        resolve_shas_parallel, run_parallel_sync, sync_entry, vendor_dir_for, ForgeType,
+        RemoteRefKey, ResolveCtx, SyncContext, SyncJob, VENDOR_DIR,
     };
+
+    #[test]
+    fn transactional_cache_preserves_active_cache_when_staged_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let vdir = dir.path().join("skills/example");
+        std::fs::create_dir_all(&vdir).unwrap();
+        std::fs::write(vdir.join("SKILL.md"), "# Existing\n").unwrap();
+        std::fs::write(vdir.join(".meta"), r#"{"sha":"old"}"#).unwrap();
+
+        let result: Result<(), SkillfileError> = replace_cache_transactionally(&vdir, |staging| {
+            std::fs::write(staging.join("SKILL.md"), "# Partial replacement\n")?;
+            Err(SkillfileError::Network("injected failure".into()))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(vdir.join("SKILL.md")).unwrap(),
+            "# Existing\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(vdir.join(".meta")).unwrap(),
+            r#"{"sha":"old"}"#
+        );
+        assert_eq!(
+            std::fs::read_dir(vdir.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn transactional_cache_publishes_complete_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let vdir = dir.path().join("skills/example");
+        std::fs::create_dir_all(&vdir).unwrap();
+        std::fs::write(vdir.join("SKILL.md"), "# Existing\n").unwrap();
+        std::fs::write(vdir.join("stale.txt"), "stale\n").unwrap();
+
+        replace_cache_transactionally(&vdir, |staging| {
+            std::fs::write(staging.join("SKILL.md"), "# Replacement\n")?;
+            std::fs::write(staging.join(".meta"), r#"{"sha":"new"}"#)?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(vdir.join("SKILL.md")).unwrap(),
+            "# Replacement\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(vdir.join(".meta")).unwrap(),
+            r#"{"sha":"new"}"#
+        );
+        assert!(!vdir.join("stale.txt").exists());
+        assert_eq!(
+            std::fs::read_dir(vdir.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
 
     // -----------------------------------------------------------------------
     // MockClient
@@ -1434,6 +1617,18 @@ mod tests {
             source: SourceFields::Github {
                 owner_repo: "owner/repo".into(),
                 path_in_repo: path_in_repo.into(),
+                ref_: "main".into(),
+            },
+        }
+    }
+
+    fn github_repo_entry(name: &str, owner_repo: &str) -> Entry {
+        Entry {
+            entity_type: EntityType::Skill,
+            name: name.into(),
+            source: SourceFields::Github {
+                owner_repo: owner_repo.into(),
+                path_in_repo: format!("skills/{name}.md"),
                 ref_: "main".into(),
             },
         }
@@ -1746,6 +1941,41 @@ mod tests {
         assert!(vdir.join(".meta").exists());
     }
 
+    #[test]
+    fn sync_entry_github_missing_directory_does_not_commit_empty_cache() {
+        let sha = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+        let dir = tempfile::tempdir().unwrap();
+        let entry = Entry {
+            entity_type: EntityType::Skill,
+            name: "missing".into(),
+            source: SourceFields::Github {
+                owner_repo: "owner/repo".into(),
+                path_in_repo: "skills/missing".into(),
+                ref_: "main".into(),
+            },
+        };
+        let client = MockClient::new()
+            .with_json(
+                "https://api.github.com/repos/owner/repo/commits/main",
+                Some(serde_json::json!({ "sha": sha }).to_string()),
+            )
+            .with_json(
+                format!("https://api.github.com/repos/owner/repo/git/trees/{sha}?recursive=1"),
+                Some(r#"{"tree":[]}"#.into()),
+            )
+            .with_json(
+                format!(
+                    "https://api.github.com/repos/owner/repo/contents/skills/missing?ref={sha}"
+                ),
+                None,
+            );
+
+        let error = sync_entry(&client, &entry, &mut make_sync_ctx(dir.path())).unwrap_err();
+
+        assert!(error.to_string().contains("failed to list directory"));
+        assert!(!vendor_dir_for(&entry, dir.path()).exists());
+    }
+
     // -----------------------------------------------------------------------
     // sync_entry -- github, SHA cached across entries
     // -----------------------------------------------------------------------
@@ -1876,7 +2106,7 @@ mod tests {
             update: false,
         };
 
-        let cache = resolve_shas_parallel(&client, &resolve_ctx).unwrap();
+        let cache = resolve_shas_parallel(&client, &resolve_ctx);
 
         assert_eq!(cache.len(), 2);
         assert_eq!(
@@ -1887,6 +2117,113 @@ mod tests {
             cache[&RemoteRefKey::new(ForgeType::Gitlab, "shared/repo", "main")],
             "gitlabsha"
         );
+    }
+
+    #[test]
+    fn resolve_shas_parallel_keeps_success_when_other_resolution_fails() {
+        let good = github_repo_entry("good", "good/repo");
+        let bad = github_repo_entry("bad", "bad/repo");
+        let entries = [&good, &bad];
+        let client = MockClient::new().with_json(
+            "https://api.github.com/repos/good/repo/commits/main",
+            Some(serde_json::json!({ "sha": "goodsha" }).to_string()),
+        );
+        let locked = BTreeMap::new();
+
+        let cache = resolve_shas_parallel(
+            &client,
+            &ResolveCtx {
+                entries: &entries,
+                locked: &locked,
+                update: false,
+            },
+        );
+
+        assert_eq!(cache.len(), 1);
+        assert_eq!(
+            cache[&RemoteRefKey::new(ForgeType::Github, "good/repo", "main")],
+            "goodsha"
+        );
+    }
+
+    #[test]
+    fn parallel_sync_fetches_healthy_entry_after_other_resolution_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = github_repo_entry("good", "good/repo");
+        let bad = github_repo_entry("bad", "bad/repo");
+        let entries = [&good, &bad];
+        let sha = "goodsha";
+        let client = MockClient::new()
+            .with_json(
+                "https://api.github.com/repos/good/repo/commits/main",
+                Some(serde_json::json!({ "sha": sha }).to_string()),
+            )
+            .with_bytes(
+                format!("https://raw.githubusercontent.com/good/repo/{sha}/skills/good.md"),
+                b"# Good".to_vec(),
+            );
+
+        let error = run_parallel_sync(SyncJob {
+            client: &client,
+            repo_root: dir.path(),
+            entries: &entries,
+            dry_run: false,
+            update: false,
+            locked: BTreeMap::new(),
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("bad/repo"));
+        assert_eq!(
+            std::fs::read_to_string(vendor_dir_for(&good, dir.path()).join("good.md")).unwrap(),
+            "# Good"
+        );
+        let lock_text = std::fs::read_to_string(dir.path().join("Skillfile.lock")).unwrap();
+        let locked: BTreeMap<String, LockEntry> = serde_json::from_str(&lock_text).unwrap();
+        assert_eq!(locked["github/skill/good"].sha, sha);
+    }
+
+    #[test]
+    fn parallel_sync_persists_healthy_entry_after_other_fetch_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = github_repo_entry("good", "good/repo");
+        let bad = github_repo_entry("bad", "bad/repo");
+        let entries = [&good, &bad];
+        let good_sha = "goodsha";
+        let bad_sha = "badsha";
+        let client = MockClient::new()
+            .with_json(
+                "https://api.github.com/repos/good/repo/commits/main",
+                Some(serde_json::json!({ "sha": good_sha }).to_string()),
+            )
+            .with_json(
+                "https://api.github.com/repos/bad/repo/commits/main",
+                Some(serde_json::json!({ "sha": bad_sha }).to_string()),
+            )
+            .with_bytes(
+                format!("https://raw.githubusercontent.com/good/repo/{good_sha}/skills/good.md"),
+                b"# Good".to_vec(),
+            );
+
+        let error = run_parallel_sync(SyncJob {
+            client: &client,
+            repo_root: dir.path(),
+            entries: &entries,
+            dry_run: false,
+            update: false,
+            locked: BTreeMap::new(),
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("bad/repo"));
+        assert_eq!(
+            std::fs::read_to_string(vendor_dir_for(&good, dir.path()).join("good.md")).unwrap(),
+            "# Good"
+        );
+        let lock_text = std::fs::read_to_string(dir.path().join("Skillfile.lock")).unwrap();
+        let locked: BTreeMap<String, LockEntry> = serde_json::from_str(&lock_text).unwrap();
+        assert_eq!(locked["github/skill/good"].sha, good_sha);
+        assert!(!locked.contains_key("github/skill/bad"));
     }
 
     // -----------------------------------------------------------------------
@@ -1943,6 +2280,10 @@ mod tests {
                 ref_: "master".into(),
             },
         };
+        let vdir = vendor_dir_for(&entry, dir.path());
+        std::fs::create_dir_all(&vdir).unwrap();
+        std::fs::write(vdir.join("SKILL.md"), "# Previous\n").unwrap();
+        std::fs::write(vdir.join("removed-upstream.txt"), "stale\n").unwrap();
 
         let sha_url = "https://api.github.com/repos/virgiliojr94/book-to-skill/commits/master";
         let sha_json = serde_json::json!({ "sha": sha }).to_string();
@@ -1972,9 +2313,9 @@ mod tests {
         let mut ctx = make_sync_ctx(dir.path());
         sync_entry(&client, &entry, &mut ctx).unwrap();
 
-        let vdir = vendor_dir_for(&entry, dir.path());
         assert!(vdir.join("SKILL.md").exists());
         assert!(vdir.join("scripts/extract.py").exists());
+        assert!(!vdir.join("removed-upstream.txt").exists());
         assert_eq!(
             std::fs::read_to_string(vdir.join("scripts/extract.py")).unwrap(),
             "print('extract')\n"
@@ -2416,7 +2757,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_dir_at_sha_empty_directory_returns_empty_map() {
+    fn fetch_dir_at_sha_missing_directory_errors() {
         let sha = "deadbeef1234deadbeef1234deadbeef12345678";
         let entry = skill_entry("empty-dir", "skills/empty-dir");
 
@@ -2433,8 +2774,10 @@ mod tests {
             .with_json(contents_url, None);
 
         let result = fetch_dir_at_sha(&client, &entry, sha);
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_empty());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("failed to list directory"));
     }
 
     // -----------------------------------------------------------------------
