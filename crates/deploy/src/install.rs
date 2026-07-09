@@ -19,8 +19,9 @@ use skillfile_core::progress;
 use skillfile_sources::strategy::{content_file, is_cached_dir_entry, is_dir_entry};
 use skillfile_sources::sync::{cmd_sync, vendor_dir_for};
 
-use crate::adapter::{adapters, AdapterScope, DeployRequest, DirInstallMode, PlatformAdapter};
+use crate::adapter::{DeployRequest, DirInstallMode};
 use crate::paths::source_path;
+use crate::target::ResolvedInstallTarget;
 
 static SNAPSHOT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -168,12 +169,6 @@ fn divergent_auto_pin_error(entry_name: &str, labels: &[String]) -> SkillfileErr
     ))
 }
 
-fn target_adapter(target: &InstallTarget) -> Result<&'static dyn PlatformAdapter, SkillfileError> {
-    adapters()
-        .get(&target.adapter)
-        .ok_or_else(|| SkillfileError::Manifest(format!("unknown adapter '{}'", target.adapter)))
-}
-
 struct SingleInstalledVariant {
     label: String,
     content: String,
@@ -186,15 +181,11 @@ fn installed_single_file_variants(
 ) -> Result<Vec<SingleInstalledVariant>, SkillfileError> {
     let mut variants = Vec::new();
     for target in &manifest.install_targets {
-        let adapter = target_adapter(target)?;
-        if !adapter.supports(entry.entity_type) {
+        let resolved = ResolvedInstallTarget::from_target(target)?;
+        if !resolved.supports(entry.entity_type) {
             continue;
         }
-        let scope = AdapterScope {
-            scope: target.scope,
-            repo_root,
-        };
-        let path = adapter.installed_path(entry, &scope);
+        let path = resolved.installed_path(entry, repo_root);
         if !path.exists() {
             continue;
         }
@@ -350,15 +341,11 @@ fn installed_dir_variants(
 ) -> Result<Vec<DirInstalledVariant>, SkillfileError> {
     let mut variants = Vec::new();
     for target in &manifest.install_targets {
-        let adapter = target_adapter(target)?;
-        if !adapter.supports(entry.entity_type) {
+        let resolved = ResolvedInstallTarget::from_target(target)?;
+        if !resolved.supports(entry.entity_type) {
             continue;
         }
-        let scope = AdapterScope {
-            scope: target.scope,
-            repo_root,
-        };
-        let files = adapter.installed_dir_files(entry, &scope);
+        let files = resolved.installed_dir_files(entry, repo_root);
         if files.is_empty() {
             continue;
         }
@@ -732,7 +719,7 @@ struct InstallValidationCtx<'a> {
     target: &'a InstallTarget,
     repo_root: &'a Path,
     source: &'a Path,
-    adapter: &'a dyn PlatformAdapter,
+    resolved_target: ResolvedInstallTarget<'a>,
     is_dir: bool,
     opts: &'a InstallOptions,
 }
@@ -771,17 +758,18 @@ fn nested_expected_paths(source: &Path, dest_root: &Path) -> HashMap<String, Pat
 }
 
 fn planned_install_paths(ctx: &InstallValidationCtx<'_>) -> HashMap<String, PathBuf> {
-    let scope = AdapterScope {
-        scope: ctx.target.scope,
-        repo_root: ctx.repo_root,
-    };
-    let target_dir = ctx.adapter.target_dir(ctx.entry.entity_type, &scope);
+    let target_dir = ctx
+        .resolved_target
+        .target_dir(ctx.entry.entity_type, ctx.repo_root);
     if !ctx.is_dir {
         let key = format!("{}.md", ctx.entry.name);
-        return HashMap::from([(key, ctx.adapter.installed_path(ctx.entry, &scope))]);
+        return HashMap::from([(
+            key,
+            ctx.resolved_target.installed_path(ctx.entry, ctx.repo_root),
+        )]);
     }
 
-    match ctx.adapter.dir_mode(ctx.entry.entity_type) {
+    match ctx.resolved_target.dir_mode(ctx.entry.entity_type) {
         Some(DirInstallMode::Flat) => flat_expected_paths(ctx.source, &target_dir),
         _ => nested_expected_paths(ctx.source, &target_dir.join(&ctx.entry.name)),
     }
@@ -798,14 +786,12 @@ fn patch_effect_path(ctx: &InstallValidationCtx<'_>) -> PathBuf {
 }
 
 fn install_effect_paths(ctx: &InstallValidationCtx<'_>) -> Vec<PathBuf> {
-    let scope = AdapterScope {
-        scope: ctx.target.scope,
-        repo_root: ctx.repo_root,
-    };
-    let target_dir = ctx.adapter.target_dir(ctx.entry.entity_type, &scope);
+    let target_dir = ctx
+        .resolved_target
+        .target_dir(ctx.entry.entity_type, ctx.repo_root);
     let mut paths = if !ctx.is_dir {
-        vec![ctx.adapter.installed_path(ctx.entry, &scope)]
-    } else if ctx.adapter.dir_mode(ctx.entry.entity_type) == Some(DirInstallMode::Flat) {
+        vec![ctx.resolved_target.installed_path(ctx.entry, ctx.repo_root)]
+    } else if ctx.resolved_target.dir_mode(ctx.entry.entity_type) == Some(DirInstallMode::Flat) {
         flat_expected_paths(ctx.source, &target_dir)
             .into_values()
             .collect()
@@ -813,7 +799,7 @@ fn install_effect_paths(ctx: &InstallValidationCtx<'_>) -> Vec<PathBuf> {
         vec![target_dir.join(&ctx.entry.name)]
     };
 
-    if ctx.adapter.dir_mode(ctx.entry.entity_type) != Some(DirInstallMode::Flat) {
+    if ctx.resolved_target.dir_mode(ctx.entry.entity_type) != Some(DirInstallMode::Flat) {
         paths.push(target_dir.join(format!("{}.md", ctx.entry.name)));
     }
     paths.push(patch_effect_path(ctx));
@@ -837,11 +823,10 @@ fn install_effect_paths_for_target(
     target: &InstallTarget,
     repo_root: &Path,
 ) -> Vec<PathBuf> {
-    let all_adapters = adapters();
-    let Some(adapter) = all_adapters.get(&target.adapter) else {
+    let Ok(resolved_target) = ResolvedInstallTarget::from_target(target) else {
         return Vec::new();
     };
-    if !adapter.supports(entry.entity_type) {
+    if !resolved_target.supports(entry.entity_type) {
         return Vec::new();
     }
     let Some(source) = source_path(entry, repo_root).filter(|path| path.exists()) else {
@@ -853,7 +838,7 @@ fn install_effect_paths_for_target(
         target,
         repo_root,
         source: &source,
-        adapter,
+        resolved_target,
         is_dir: is_dir_entry(entry) || source.is_dir(),
         opts: &default_opts,
     };
@@ -966,13 +951,16 @@ fn deploy_and_patch_entry(
     validation_ctx: &InstallValidationCtx<'_>,
     plan: &InstallPlan,
 ) -> Result<InstallOutcome, SkillfileError> {
-    let installed = validation_ctx.adapter.deploy_entry(&DeployRequest {
-        entry: validation_ctx.entry,
-        source: validation_ctx.source,
-        scope: validation_ctx.target.scope,
-        repo_root: validation_ctx.repo_root,
-        opts: validation_ctx.opts,
-    });
+    let installed = validation_ctx
+        .resolved_target
+        .adapter()
+        .deploy_entry(&DeployRequest {
+            entry: validation_ctx.entry,
+            source: validation_ctx.source,
+            scope: validation_ctx.resolved_target.scope(),
+            repo_root: validation_ctx.repo_root,
+            opts: validation_ctx.opts,
+        });
 
     if validation_ctx.opts.dry_run {
         return Ok(InstallOutcome::Skipped(InstallSkipReason::DryRun));
@@ -1007,12 +995,11 @@ pub fn install_entry_with_outcome(
     let default_opts = InstallOptions::default();
     let opts = ctx.opts.unwrap_or(&default_opts);
 
-    let all_adapters = adapters();
-    let Some(adapter) = all_adapters.get(&target.adapter) else {
+    let Ok(resolved_target) = ResolvedInstallTarget::from_target(target) else {
         return Ok(InstallOutcome::Skipped(InstallSkipReason::UnknownAdapter));
     };
 
-    if !adapter.supports(entry.entity_type) {
+    if !resolved_target.supports(entry.entity_type) {
         return Ok(InstallOutcome::Skipped(
             InstallSkipReason::UnsupportedEntity,
         ));
@@ -1032,7 +1019,7 @@ pub fn install_entry_with_outcome(
         target,
         repo_root: ctx.repo_root,
         source: &source,
-        adapter,
+        resolved_target,
         is_dir,
         opts,
     };
@@ -1168,18 +1155,18 @@ fn install_entry_or_conflict(
 
 fn deploy_all(manifest: &Manifest, ctx: &DeployCtx<'_>) -> Result<(), SkillfileError> {
     let mode = if ctx.opts.dry_run { " [dry-run]" } else { "" };
-    let all_adapters = adapters();
 
     for target in &manifest.install_targets {
-        if !all_adapters.contains(&target.adapter) {
-            eprintln!("warning: unknown platform '{}', skipping", target.adapter);
+        if matches!(target, InstallTarget::Platform { .. })
+            && ResolvedInstallTarget::from_target(target).is_err()
+        {
+            eprintln!(
+                "warning: unknown platform '{}', skipping",
+                target.platform_name()
+            );
             continue;
         }
-        progress!(
-            "Installing for {} ({}){mode}...",
-            target.adapter,
-            target.scope
-        );
+        progress!("Installing for {target}{mode}...");
         for entry in &manifest.entries {
             install_entry_or_conflict(entry, target, ctx)?;
         }
@@ -1240,7 +1227,7 @@ fn print_first_install_hint(manifest: &Manifest) {
     let platforms: Vec<String> = manifest
         .install_targets
         .iter()
-        .map(|t| format!("{} ({})", t.adapter, t.scope))
+        .map(ToString::to_string)
         .collect();
     progress!("  Configured platforms: {}", platforms.join(", "));
     progress!("  Run `skillfile init` to add or change platforms.");
@@ -1410,10 +1397,7 @@ mod tests {
     }
 
     fn make_target(adapter: &str, scope: Scope) -> InstallTarget {
-        InstallTarget {
-            adapter: adapter.into(),
-            scope,
-        }
+        InstallTarget::platform(adapter, scope)
     }
 
     // -- install_entry: local source --

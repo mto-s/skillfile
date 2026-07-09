@@ -322,10 +322,8 @@ fn parse_install_line(parts: &[String], lineno: usize, acc: &mut ParseAccumulato
     }
     let scope_str = &parts[2];
     if let Some(scope) = Scope::parse(scope_str) {
-        acc.install_targets.push(InstallTarget {
-            adapter: parts[1].clone(),
-            scope,
-        });
+        acc.install_targets
+            .push(InstallTarget::platform(parts[1].clone(), scope));
     } else {
         let valid: Vec<&str> = Scope::ALL
             .iter()
@@ -337,6 +335,51 @@ fn parse_install_line(parts: &[String], lineno: usize, acc: &mut ParseAccumulato
             valid.join(", ")
         ));
     }
+}
+
+fn parse_install_path_line(parts: &[String], lineno: usize, acc: &mut ParseAccumulator) {
+    if parts.len() < 4 {
+        acc.warnings.push(format!(
+            "warning: line {lineno}: install-path line needs: tool-name entity-type path"
+        ));
+        return;
+    }
+
+    let tool_name = &parts[1];
+    if tool_name.trim().is_empty() {
+        acc.warnings.push(format!(
+            "warning: line {lineno}: install-path tool-name must not be empty"
+        ));
+        return;
+    }
+
+    let entity_type_str = &parts[2];
+    let Some(entity_type) = EntityType::parse(entity_type_str) else {
+        let valid: Vec<&str> = EntityType::ALL
+            .iter()
+            .map(super::models::EntityType::as_str)
+            .collect();
+        acc.warnings.push(format!(
+            "warning: line {lineno}: invalid entity type '{entity_type_str}', \
+             must be one of: {}",
+            valid.join(", ")
+        ));
+        return;
+    };
+
+    let path = &parts[3];
+    if path.trim().is_empty() {
+        acc.warnings.push(format!(
+            "warning: line {lineno}: install-path path must not be empty"
+        ));
+        return;
+    }
+
+    acc.install_targets.push(InstallTarget::path(
+        tool_name.clone(),
+        entity_type,
+        path.clone(),
+    ));
 }
 
 fn validate_and_push_entry(entry: Entry, lineno: usize, acc: &mut ParseAccumulator) {
@@ -429,6 +472,7 @@ pub fn parse_manifest(manifest_path: &Path) -> Result<ParseResult, SkillfileErro
 
         match parts[0].as_str() {
             "install" => parse_install_line(&parts, lineno, &mut acc),
+            "install-path" => parse_install_path_line(&parts, lineno, &mut acc),
             _ if KNOWN_SOURCES.contains(&parts[0].as_str()) => {
                 process_source_line(&parts, lineno, &mut acc);
             }
@@ -761,8 +805,7 @@ mod tests {
         let r = parse_manifest(&p).unwrap();
         assert_eq!(r.manifest.install_targets.len(), 1);
         let t = &r.manifest.install_targets[0];
-        assert_eq!(t.adapter, "claude-code");
-        assert_eq!(t.scope, Scope::Global);
+        assert_eq!(t, &InstallTarget::platform("claude-code", Scope::Global));
     }
 
     #[test]
@@ -774,8 +817,29 @@ mod tests {
         );
         let r = parse_manifest(&p).unwrap();
         assert_eq!(r.manifest.install_targets.len(), 2);
-        assert_eq!(r.manifest.install_targets[0].scope, Scope::Global);
-        assert_eq!(r.manifest.install_targets[1].scope, Scope::Local);
+        assert_eq!(
+            r.manifest.install_targets[0],
+            InstallTarget::platform("claude-code", Scope::Global)
+        );
+        assert_eq!(
+            r.manifest.install_targets[1],
+            InstallTarget::platform("claude-code", Scope::Local)
+        );
+    }
+
+    #[test]
+    fn install_path_target_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_manifest(
+            dir.path(),
+            "install-path  openclaw  skill  ~/.openclaw/skills",
+        );
+        let r = parse_manifest(&p).unwrap();
+        assert_eq!(r.manifest.install_targets.len(), 1);
+        assert_eq!(
+            r.manifest.install_targets[0],
+            InstallTarget::path("openclaw", EntityType::Skill, "~/.openclaw/skills")
+        );
     }
 
     #[test]
@@ -848,7 +912,25 @@ mod tests {
         let p = write_manifest(dir.path(), "install  claude-code  global  # primary target");
         let r = parse_manifest(&p).unwrap();
         assert_eq!(r.manifest.install_targets.len(), 1);
-        assert_eq!(r.manifest.install_targets[0].scope, Scope::Global);
+        assert_eq!(
+            r.manifest.install_targets[0],
+            InstallTarget::platform("claude-code", Scope::Global)
+        );
+    }
+
+    #[test]
+    fn inline_comment_on_install_path_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_manifest(
+            dir.path(),
+            "install-path  misc-target  agent  ./agents  # custom target",
+        );
+        let r = parse_manifest(&p).unwrap();
+        assert_eq!(r.manifest.install_targets.len(), 1);
+        assert_eq!(
+            r.manifest.install_targets[0],
+            InstallTarget::path("misc-target", EntityType::Agent, "./agents")
+        );
     }
 
     #[test]
@@ -970,7 +1052,10 @@ mod tests {
             let p = write_manifest(dir.path(), &format!("install  claude-code  {scope_str}"));
             let r = parse_manifest(&p).unwrap();
             assert_eq!(r.manifest.install_targets.len(), 1);
-            assert_eq!(r.manifest.install_targets[0].scope, *expected);
+            assert_eq!(
+                r.manifest.install_targets[0],
+                InstallTarget::platform("claude-code", *expected)
+            );
         }
     }
 
@@ -984,6 +1069,33 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.to_lowercase().contains("scope") || w.to_lowercase().contains("warning")));
+    }
+
+    #[test]
+    fn invalid_install_path_entity_type_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_manifest(dir.path(), "install-path  misc-target  bot  ./target");
+        let r = parse_manifest(&p).unwrap();
+        assert!(r.manifest.install_targets.is_empty());
+        assert!(r.warnings.iter().any(|w| w.contains("invalid entity type")));
+    }
+
+    #[test]
+    fn empty_install_path_tool_name_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_manifest(dir.path(), "install-path  \"\"  skill  ./target");
+        let r = parse_manifest(&p).unwrap();
+        assert!(r.manifest.install_targets.is_empty());
+        assert!(r.warnings.iter().any(|w| w.contains("tool-name")));
+    }
+
+    #[test]
+    fn empty_install_path_path_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_manifest(dir.path(), "install-path  misc-target  skill  \"\"");
+        let r = parse_manifest(&p).unwrap();
+        assert!(r.manifest.install_targets.is_empty());
+        assert!(r.warnings.iter().any(|w| w.contains("path")));
     }
 
     // -------------------------------------------------------------------
@@ -1020,10 +1132,7 @@ mod tests {
         assert_eq!(r.manifest.install_targets.len(), 1);
         assert_eq!(
             r.manifest.install_targets[0],
-            InstallTarget {
-                adapter: "claude-code".into(),
-                scope: Scope::Global,
-            }
+            InstallTarget::platform("claude-code", Scope::Global)
         );
     }
 

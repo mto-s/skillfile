@@ -6,6 +6,7 @@ use skillfile_core::parser::{parse_manifest, MANIFEST_NAME};
 use skillfile_sources::strategy::format_parts;
 
 const INSTALL_COMMENT: &str = "# install  <platform>  <scope>";
+const INSTALL_PATH_COMMENT: &str = "# install-path  <tool-name>  <entity-type>  <path>";
 
 fn section_headers(entity_type: &str) -> Vec<&'static str> {
     match entity_type {
@@ -92,7 +93,11 @@ fn extract_entry_comments(raw_text: &str) -> std::collections::HashMap<String, V
             pending.push(line.trim_end().to_string());
             continue;
         }
-        if stripped.is_empty() || stripped.starts_with("install") {
+        if stripped.is_empty() || stripped.starts_with("install ") || stripped == "install" {
+            pending.clear();
+            continue;
+        }
+        if stripped.starts_with("install-path ") || stripped == "install-path" {
             pending.clear();
             continue;
         }
@@ -134,9 +139,23 @@ pub fn sorted_manifest_text(manifest: &Manifest, raw_text: &str) -> String {
 
     // Install targets section
     if !manifest.install_targets.is_empty() {
-        lines.push(INSTALL_COMMENT.to_string());
+        if manifest.install_targets.iter().any(|target| {
+            matches!(
+                target,
+                skillfile_core::models::InstallTarget::Platform { .. }
+            )
+        }) {
+            lines.push(INSTALL_COMMENT.to_string());
+        }
+        if manifest
+            .install_targets
+            .iter()
+            .any(|target| matches!(target, skillfile_core::models::InstallTarget::Path { .. }))
+        {
+            lines.push(INSTALL_PATH_COMMENT.to_string());
+        }
         for target in &manifest.install_targets {
-            lines.push(format!("install  {}  {}", target.adapter, target.scope));
+            lines.push(target.manifest_line());
         }
     }
 
@@ -224,10 +243,7 @@ mod tests {
     }
 
     fn itarget(adapter: &str, scope: Scope) -> InstallTarget {
-        InstallTarget {
-            adapter: adapter.into(),
-            scope,
-        }
+        InstallTarget::platform(adapter, scope)
     }
 
     #[test]

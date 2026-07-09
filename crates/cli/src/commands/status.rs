@@ -533,10 +533,7 @@ mod tests {
     }
 
     fn claude_local_target() -> InstallTarget {
-        InstallTarget {
-            adapter: "claude-code".into(),
-            scope: Scope::Local,
-        }
+        InstallTarget::platform("claude-code", Scope::Local)
     }
 
     fn agent_manifest() -> Manifest {
@@ -1044,10 +1041,7 @@ mod tests {
             entries: vec![local_entry("x", "x.md")],
             install_targets: vec![
                 claude_local_target(),
-                InstallTarget {
-                    adapter: "cursor".into(),
-                    scope: Scope::Global,
-                },
+                InstallTarget::platform("cursor", Scope::Global),
             ],
         };
         let out = format_summary(&manifest, dir.path());
@@ -1102,10 +1096,7 @@ mod tests {
             entries: vec![entry.clone()],
             install_targets: vec![
                 claude_local_target(),
-                InstallTarget {
-                    adapter: "copilot".into(),
-                    scope: Scope::Local,
-                },
+                InstallTarget::platform("copilot", Scope::Local),
             ],
         };
 
@@ -1167,10 +1158,7 @@ mod tests {
             entries: dir_skill_manifest().entries,
             install_targets: vec![
                 claude_local_target(),
-                InstallTarget {
-                    adapter: "copilot".into(),
-                    scope: Scope::Local,
-                },
+                InstallTarget::platform("copilot", Scope::Local),
             ],
         };
         let entry = &manifest.entries[0];

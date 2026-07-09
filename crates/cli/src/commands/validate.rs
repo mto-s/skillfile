@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use console::{style, StyledObject};
 use skillfile_core::error::SkillfileError;
 use skillfile_core::lock::{lock_key, read_lock};
-use skillfile_core::models::{Manifest, Scope, SourceFields};
+use skillfile_core::models::{EntityType, InstallTarget, Manifest, SourceFields};
 use skillfile_core::parser::{parse_manifest, MANIFEST_NAME};
 use skillfile_deploy::adapter::adapters;
+use skillfile_deploy::target::ResolvedInstallTarget;
 
 fn check_duplicate_names(manifest: &Manifest, errors: &mut Vec<String>) {
     let mut seen: HashMap<String, String> = HashMap::new();
@@ -41,25 +42,80 @@ fn check_local_paths(manifest: &Manifest, repo_root: &Path, errors: &mut Vec<Str
 fn check_platforms(manifest: &Manifest, errors: &mut Vec<String>) {
     let all_adapters = adapters();
     for target in &manifest.install_targets {
-        if !all_adapters.contains(&target.adapter) {
-            errors.push(format!("unknown platform: '{}'", target.adapter));
+        let InstallTarget::Platform { adapter, .. } = target else {
+            continue;
+        };
+        if !all_adapters.contains(adapter) {
+            errors.push(format!("unknown platform: '{adapter}'"));
         }
     }
 }
 
-fn check_duplicate_targets(manifest: &Manifest, errors: &mut Vec<String>) {
-    let mut seen_targets: HashSet<(String, Scope)> = HashSet::new();
-    for target in &manifest.install_targets {
-        let key = (target.adapter.clone(), target.scope);
-        if seen_targets.contains(&key) {
-            errors.push(format!(
-                "duplicate install target: '{} {}'",
-                target.adapter, target.scope
-            ));
-        } else {
-            seen_targets.insert(key);
+fn duplicate_target_message(
+    target: &InstallTarget,
+    entity_type: EntityType,
+    path: &Path,
+) -> String {
+    let target_label = match target {
+        InstallTarget::Platform { adapter, scope } => {
+            format!("{adapter} {scope}")
+        }
+        InstallTarget::Path {
+            tool_name,
+            entity_type,
+            path,
+        } => format!("{tool_name} {entity_type} {path}"),
+    };
+    format!(
+        "duplicate install target for {entity_type} path '{}': '{target_label}'",
+        path.display()
+    )
+}
+
+fn normalized_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
         }
     }
+    normalized
+}
+
+fn resolved_target_paths(target: &InstallTarget, repo_root: &Path) -> Vec<(EntityType, PathBuf)> {
+    let Ok(resolved) = ResolvedInstallTarget::from_target(target) else {
+        return Vec::new();
+    };
+    EntityType::ALL
+        .iter()
+        .copied()
+        .filter(|entity_type| resolved.supports(*entity_type))
+        .map(|entity_type| {
+            let path = normalized_path(&resolved.target_dir(entity_type, repo_root));
+            (entity_type, path)
+        })
+        .collect()
+}
+
+fn check_duplicate_targets(manifest: &Manifest, repo_root: &Path, errors: &mut Vec<String>) {
+    let mut seen_targets: HashSet<(EntityType, PathBuf)> = HashSet::new();
+    let duplicate_messages = manifest
+        .install_targets
+        .iter()
+        .flat_map(|target| {
+            resolved_target_paths(target, repo_root)
+                .into_iter()
+                .map(move |(entity_type, path)| (target, entity_type, path))
+        })
+        .filter_map(|(target, entity_type, path)| {
+            (!seen_targets.insert((entity_type, path.clone())))
+                .then(|| duplicate_target_message(target, entity_type, &path))
+        });
+    errors.extend(duplicate_messages);
 }
 
 fn check_orphaned_locks(
@@ -120,7 +176,7 @@ pub fn cmd_validate(repo_root: &Path) -> Result<(), SkillfileError> {
     check_duplicate_names(&manifest, &mut errors);
     check_local_paths(&manifest, repo_root, &mut errors);
     check_platforms(&manifest, &mut errors);
-    check_duplicate_targets(&manifest, &mut errors);
+    check_duplicate_targets(&manifest, repo_root, &mut errors);
     check_orphaned_locks(&manifest, repo_root, &mut errors)?;
 
     if !errors.is_empty() {
@@ -266,6 +322,30 @@ mod tests {
         write_manifest(
             dir.path(),
             "install  claude-code  global\ninstall  claude-code  global\n",
+        );
+        let result = cmd_validate(dir.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn duplicate_install_target_resolves_path_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(
+            dir.path(),
+            "install-path  custom-a  skill  ./out/skills\n\
+             install-path  custom-b  skill  out/./skills\n",
+        );
+        let result = cmd_validate(dir.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn duplicate_install_target_matches_builtin_resolved_path() {
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(
+            dir.path(),
+            "install  claude-code  local\n\
+             install-path  custom  skill  .claude/skills\n",
         );
         let result = cmd_validate(dir.path());
         assert!(result.is_err());

@@ -118,10 +118,7 @@ fn write_personal_config(new_targets: &[(String, String)]) -> Result<(), Skillfi
     use skillfile_core::models::{InstallTarget, Scope};
     let targets: Vec<InstallTarget> = new_targets
         .iter()
-        .map(|(a, s)| InstallTarget {
-            adapter: a.clone(),
-            scope: Scope::parse(s).unwrap_or(Scope::Local),
-        })
+        .map(|(a, s)| InstallTarget::platform(a.clone(), Scope::parse(s).unwrap_or(Scope::Local)))
         .collect();
     crate::config::write_user_targets(&targets)?;
     Ok(())
@@ -458,6 +455,25 @@ fn persist_targets(
     Ok(())
 }
 
+fn print_init_outro(entry_count: usize) -> Result<(), SkillfileError> {
+    let outro = if entry_count == 0 {
+        "You're all set! Next up:".to_string()
+    } else {
+        let word = if entry_count == 1 { "entry" } else { "entries" };
+        format!(
+            "Platforms configured! This Skillfile already has {entry_count} {word}.\n  \
+             \u{1f680} Run `skillfile install` to fetch and deploy them."
+        )
+    };
+    cliclack::outro(format!(
+        "{outro}\n  \
+         \u{2795} `skillfile add` to add a skill or agent\n  \
+         \u{1f50d} `skillfile search` to discover community skills\n  \
+         \u{1f4ac} `skillfile completions <bash|zsh|fish>` for tab completion"
+    ))?;
+    Ok(())
+}
+
 pub fn cmd_init(repo_root: &Path) -> Result<(), SkillfileError> {
     // TTY guard: cliclack requires an interactive terminal. Check stdin, stdout,
     // and the CI env var because some CI runners (macOS GitHub Actions) report
@@ -489,19 +505,21 @@ pub fn cmd_init(repo_root: &Path) -> Result<(), SkillfileError> {
     let existing_set: std::collections::HashSet<&str> = existing
         .iter()
         .chain(user_targets.iter())
-        .map(|t| t.adapter.as_str())
+        .filter_map(|t| match t {
+            skillfile_core::models::InstallTarget::Platform { adapter, .. } => {
+                Some(adapter.as_str())
+            }
+            skillfile_core::models::InstallTarget::Path { .. } => None,
+        })
         .collect();
 
     if !existing.is_empty() || !user_targets.is_empty() {
         let mut lines: Vec<String> = existing
             .iter()
-            .map(|t| format!("install  {}  {}  (Skillfile)", t.adapter, t.scope))
+            .map(|t| format!("{}  (Skillfile)", t.manifest_line()))
             .collect();
         for t in &user_targets {
-            lines.push(format!(
-                "install  {}  {}  (personal config)",
-                t.adapter, t.scope
-            ));
+            lines.push(format!("{}  (personal config)", t.manifest_line()));
         }
         cliclack::note("Existing config", lines.join("\n"))?;
     }
@@ -516,23 +534,7 @@ pub fn cmd_init(repo_root: &Path) -> Result<(), SkillfileError> {
     persist_targets(&manifest_path, destination, &new_targets)?;
     setup_forge_tokens()?;
     update_gitignore(repo_root)?;
-
-    let outro = if result.manifest.entries.is_empty() {
-        "You're all set! Next up:".to_string()
-    } else {
-        let n = result.manifest.entries.len();
-        let word = if n == 1 { "entry" } else { "entries" };
-        format!(
-            "Platforms configured! This Skillfile already has {n} {word}.\n  \
-                 \u{1f680} Run `skillfile install` to fetch and deploy them."
-        )
-    };
-    cliclack::outro(format!(
-        "{outro}\n  \
-         \u{2795} `skillfile add` to add a skill or agent\n  \
-         \u{1f50d} `skillfile search` to discover community skills\n  \
-         \u{1f4ac} `skillfile completions <bash|zsh|fish>` for tab completion"
-    ))?;
+    print_init_outro(result.manifest.entries.len())?;
 
     Ok(())
 }

@@ -7,7 +7,8 @@ use skillfile_core::patch::walkdir;
 use skillfile_sources::strategy::{content_file, is_cached_dir_entry, meta_sha};
 use skillfile_sources::sync::vendor_dir_for;
 
-use crate::adapter::{adapters, AdapterScope, PlatformAdapter};
+use crate::adapter::{adapters, AdapterScope};
+use crate::target::ResolvedInstallTarget;
 
 pub fn resolve_target_dir(
     adapter_name: &str,
@@ -26,12 +27,8 @@ pub fn installed_path(
     manifest: &Manifest,
     repo_root: &Path,
 ) -> Result<PathBuf, SkillfileError> {
-    let adapter = first_target(manifest)?;
-    let ctx = AdapterScope {
-        scope: manifest.install_targets[0].scope,
-        repo_root,
-    };
-    Ok(adapter.installed_path(entry, &ctx))
+    let target = first_supporting_target(entry, manifest)?;
+    Ok(target.installed_path(entry, repo_root))
 }
 
 /// Installed paths for a single-file entry across all install targets.
@@ -42,15 +39,11 @@ pub fn installed_paths(
 ) -> Result<Vec<PathBuf>, SkillfileError> {
     let mut paths = Vec::new();
     for target in &manifest.install_targets {
-        let adapter = adapter_for(target)?;
-        if !adapter.supports(entry.entity_type) {
+        let target = resolved_target(target)?;
+        if !target.supports(entry.entity_type) {
             continue;
         }
-        let ctx = AdapterScope {
-            scope: target.scope,
-            repo_root,
-        };
-        paths.push(adapter.installed_path(entry, &ctx));
+        paths.push(target.installed_path(entry, repo_root));
     }
     Ok(paths)
 }
@@ -61,12 +54,8 @@ pub fn installed_dir_files(
     manifest: &Manifest,
     repo_root: &Path,
 ) -> Result<HashMap<String, PathBuf>, SkillfileError> {
-    let adapter = first_target(manifest)?;
-    let ctx = AdapterScope {
-        scope: manifest.install_targets[0].scope,
-        repo_root,
-    };
-    Ok(adapter.installed_dir_files(entry, &ctx))
+    let target = first_supporting_target(entry, manifest)?;
+    Ok(target.installed_dir_files(entry, repo_root))
 }
 
 /// Installed file maps for a directory entry across all install targets.
@@ -77,15 +66,11 @@ pub fn installed_dir_file_sets(
 ) -> Result<Vec<HashMap<String, PathBuf>>, SkillfileError> {
     let mut file_sets = Vec::new();
     for target in &manifest.install_targets {
-        let adapter = adapter_for(target)?;
-        if !adapter.supports(entry.entity_type) {
+        let target = resolved_target(target)?;
+        if !target.supports(entry.entity_type) {
             continue;
         }
-        let ctx = AdapterScope {
-            scope: target.scope,
-            repo_root,
-        };
-        file_sets.push(adapter.installed_dir_files(entry, &ctx));
+        file_sets.push(target.installed_dir_files(entry, repo_root));
     }
     Ok(file_sets)
 }
@@ -130,21 +115,31 @@ fn remote_dir_cache_is_complete(entry: &Entry, vdir: &Path) -> bool {
     }
 }
 
-fn first_target(manifest: &Manifest) -> Result<&'static dyn PlatformAdapter, SkillfileError> {
+fn first_supporting_target<'a>(
+    entry: &Entry,
+    manifest: &'a Manifest,
+) -> Result<ResolvedInstallTarget<'a>, SkillfileError> {
     if manifest.install_targets.is_empty() {
         return Err(SkillfileError::Manifest(
             "no install targets configured — run `skillfile install` first".into(),
         ));
     }
-    adapter_for(&manifest.install_targets[0])
+    for target in &manifest.install_targets {
+        let resolved = resolved_target(target)?;
+        if resolved.supports(entry.entity_type) {
+            return Ok(resolved);
+        }
+    }
+    Err(SkillfileError::Manifest(format!(
+        "no install target supports {} '{}'",
+        entry.entity_type, entry.name
+    )))
 }
 
-fn adapter_for(
+fn resolved_target(
     target: &skillfile_core::models::InstallTarget,
-) -> Result<&'static dyn PlatformAdapter, SkillfileError> {
-    adapters()
-        .get(&target.adapter)
-        .ok_or_else(|| SkillfileError::Manifest(format!("unknown adapter '{}'", target.adapter)))
+) -> Result<ResolvedInstallTarget<'_>, SkillfileError> {
+    ResolvedInstallTarget::from_target(target)
 }
 
 #[cfg(test)]
@@ -210,10 +205,7 @@ mod tests {
         };
         let manifest = Manifest {
             entries: vec![entry.clone()],
-            install_targets: vec![InstallTarget {
-                adapter: "unknown".into(),
-                scope: Scope::Global,
-            }],
+            install_targets: vec![InstallTarget::platform("unknown", Scope::Global)],
         };
         let result = installed_path(&entry, &manifest, Path::new("/tmp"));
         assert!(result.is_err());
@@ -234,10 +226,7 @@ mod tests {
         };
         let manifest = Manifest {
             entries: vec![entry.clone()],
-            install_targets: vec![InstallTarget {
-                adapter: "claude-code".into(),
-                scope: Scope::Local,
-            }],
+            install_targets: vec![InstallTarget::platform("claude-code", Scope::Local)],
         };
         let result = installed_path(&entry, &manifest, tmp.path()).unwrap();
         assert_eq!(result, tmp.path().join(".claude/agents/test.md"));
@@ -258,14 +247,8 @@ mod tests {
         let manifest = Manifest {
             entries: vec![entry.clone()],
             install_targets: vec![
-                InstallTarget {
-                    adapter: "claude-code".into(),
-                    scope: Scope::Local,
-                },
-                InstallTarget {
-                    adapter: "copilot".into(),
-                    scope: Scope::Local,
-                },
+                InstallTarget::platform("claude-code", Scope::Local),
+                InstallTarget::platform("copilot", Scope::Local),
             ],
         };
 
@@ -308,10 +291,7 @@ mod tests {
         };
         let manifest = Manifest {
             entries: vec![entry.clone()],
-            install_targets: vec![InstallTarget {
-                adapter: "claude-code".into(),
-                scope: Scope::Local,
-            }],
+            install_targets: vec![InstallTarget::platform("claude-code", Scope::Local)],
         };
         let skill_dir = tmp.path().join(".claude/skills/my-skill");
         std::fs::create_dir_all(&skill_dir).unwrap();
@@ -336,14 +316,8 @@ mod tests {
         let manifest = Manifest {
             entries: vec![entry.clone()],
             install_targets: vec![
-                InstallTarget {
-                    adapter: "claude-code".into(),
-                    scope: Scope::Local,
-                },
-                InstallTarget {
-                    adapter: "copilot".into(),
-                    scope: Scope::Local,
-                },
+                InstallTarget::platform("claude-code", Scope::Local),
+                InstallTarget::platform("copilot", Scope::Local),
             ],
         };
         let claude_dir = tmp.path().join(".claude/skills/my-skill");
@@ -372,10 +346,7 @@ mod tests {
         };
         let manifest = Manifest {
             entries: vec![entry.clone()],
-            install_targets: vec![InstallTarget {
-                adapter: "claude-code".into(),
-                scope: Scope::Local,
-            }],
+            install_targets: vec![InstallTarget::platform("claude-code", Scope::Local)],
         };
         // Create vendor cache
         let vdir = tmp.path().join(".skillfile/cache/agents/my-agents");
