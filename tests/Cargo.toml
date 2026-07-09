@@ -21,6 +21,10 @@ name = "install_directory_layout"
 path = "install_directory_layout.rs"
 
 [[test]]
+name = "install_path"
+path = "install_path.rs"
+
+[[test]]
 name = "junie"
 path = "junie.rs"
 
