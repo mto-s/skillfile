@@ -40,34 +40,12 @@ fn is_valid_name(name: &str) -> bool {
             .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
 }
 
-fn flush_token(current: &mut String, parts: &mut Vec<String>) {
-    if !current.is_empty() {
-        parts.push(std::mem::take(current));
-    }
-}
-
-/// Split a manifest line respecting double-quoted fields.
+/// Split a manifest line using shell-style field quoting.
 ///
 /// Unquoted lines split identically to whitespace split.
-/// Double-quoted fields preserve internal spaces.
-fn split_line(line: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-
-    for ch in line.chars() {
-        if ch == '"' {
-            in_quotes = !in_quotes;
-            continue;
-        }
-        if ch.is_whitespace() && !in_quotes {
-            flush_token(&mut current, &mut parts);
-            continue;
-        }
-        current.push(ch);
-    }
-    flush_token(&mut current, &mut parts);
-    parts
+/// Quoted fields preserve internal spaces and comment markers.
+fn split_line(line: &str) -> Option<Vec<String>> {
+    shlex::split(line)
 }
 
 fn strip_inline_comment(parts: Vec<String>) -> Vec<String> {
@@ -463,7 +441,12 @@ pub fn parse_manifest(manifest_path: &Path) -> Result<ParseResult, SkillfileErro
             continue;
         }
 
-        let parts = strip_inline_comment(split_line(line));
+        let Some(parts) = split_line(line) else {
+            acc.warnings
+                .push(format!("warning: line {lineno}: invalid quoting, skipping"));
+            continue;
+        };
+        let parts = strip_inline_comment(parts);
         if parts.len() < 2 {
             acc.warnings
                 .push(format!("warning: line {lineno}: too few fields, skipping"));
@@ -495,7 +478,7 @@ pub fn parse_manifest(manifest_path: &Path) -> Result<ParseResult, SkillfileErro
 
 #[must_use]
 pub fn parse_manifest_line(line: &str) -> Option<Entry> {
-    let parts = split_line(line);
+    let parts = split_line(line)?;
     let parts = strip_inline_comment(parts);
     if parts.len() < 3 {
         return None;
@@ -1170,8 +1153,8 @@ mod tests {
             &p,
             [
                 240, 174, 174, 174, 240, 174, 174, 170, 240, 105, 116, 104, 117, 97, 10, 103, 105,
-                116, 104, 117, 98, 12, 97, 103, 101, 110, 116, 12, 117, 115, 64, 116, 97, 108, 170,
-                170, 115, 47, 108, 1, 57, 12, 108, 12, 59, 239, 191, 10,
+                116, 104, 117, 98, 32, 97, 103, 101, 110, 116, 32, 117, 115, 64, 116, 97, 108, 170,
+                170, 115, 47, 108, 1, 57, 32, 108, 32, 59, 239, 191, 10,
             ],
         )
         .unwrap();
@@ -1232,7 +1215,7 @@ mod tests {
     #[test]
     fn split_line_simple() {
         assert_eq!(
-            split_line("github  agent  owner/repo  agent.md"),
+            split_line("github  agent  owner/repo  agent.md").unwrap(),
             vec!["github", "agent", "owner/repo", "agent.md"]
         );
     }
@@ -1240,15 +1223,32 @@ mod tests {
     #[test]
     fn split_line_quoted() {
         assert_eq!(
-            split_line("local  skill  \"my dir/foo.md\""),
+            split_line("local  skill  \"my dir/foo.md\"").unwrap(),
             vec!["local", "skill", "my dir/foo.md"]
         );
     }
 
     #[test]
+    fn split_line_single_quoted() {
+        assert_eq!(
+            split_line("local  skill  'my dir/foo.md'").unwrap(),
+            vec!["local", "skill", "my dir/foo.md"]
+        );
+    }
+
+    #[test]
+    fn invalid_quoting_warns_and_skips_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_manifest(dir.path(), "local  skill  \"unterminated.md");
+        let r = parse_manifest(&p).unwrap();
+        assert!(r.manifest.entries.is_empty());
+        assert!(r.warnings.iter().any(|w| w.contains("invalid quoting")));
+    }
+
+    #[test]
     fn split_line_tabs() {
         assert_eq!(
-            split_line("local\tskill\tfoo.md"),
+            split_line("local\tskill\tfoo.md").unwrap(),
             vec!["local", "skill", "foo.md"]
         );
     }

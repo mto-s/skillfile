@@ -340,8 +340,18 @@ impl InstallTarget {
                 tool_name,
                 entity_type,
                 path,
-            } => format!("install-path  {tool_name}  {entity_type}  {path}"),
+            } => format!(
+                "install-path  {tool_name}  {entity_type}  {}",
+                quote_manifest_field(path)
+            ),
         }
+    }
+}
+
+fn quote_manifest_field(value: &str) -> String {
+    match shlex::try_quote(value) {
+        Ok(quoted) => quoted.into_owned(),
+        Err(_) => value.to_string(),
     }
 }
 
@@ -599,6 +609,33 @@ mod tests {
         assert_eq!(t.entity_type(), Some(EntityType::Skill));
         assert_eq!(t.path_str(), Some("~/.openclaw/skills"));
         assert_eq!(t.to_string(), "openclaw skill (~/.openclaw/skills)");
+    }
+
+    #[test]
+    fn install_path_manifest_line_quotes_path_when_needed() {
+        let t = InstallTarget::path("openclaw", EntityType::Skill, "./custom skills");
+        assert_eq!(
+            t.manifest_line(),
+            "install-path  openclaw  skill  './custom skills'"
+        );
+    }
+
+    #[test]
+    fn install_path_manifest_line_quotes_hash_path() {
+        let t = InstallTarget::path("openclaw", EntityType::Skill, "./skills#custom");
+        assert_eq!(
+            t.manifest_line(),
+            "install-path  openclaw  skill  './skills#custom'"
+        );
+    }
+
+    #[test]
+    fn install_path_manifest_line_quotes_embedded_double_quote() {
+        let t = InstallTarget::path("openclaw", EntityType::Skill, "./custom \"skills\"");
+        assert_eq!(
+            t.manifest_line(),
+            "install-path  openclaw  skill  './custom \"skills\"'"
+        );
     }
 
     #[test]

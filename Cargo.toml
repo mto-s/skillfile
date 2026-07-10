@@ -44,6 +44,9 @@ semver = "1"
 # Diff/patch
 similar = "3"
 
+# Manifest field quoting
+shlex = "1"
+
 # HTML entity decoding
 html-escape = "0.2"
 
