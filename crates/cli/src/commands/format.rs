@@ -398,6 +398,15 @@ mod tests {
     }
 
     #[test]
+    fn cmd_format_preserves_quoted_install_path_tool_name() {
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(dir.path(), "install-path  \"my tool\"  skill  ./out\n");
+        cmd_format(dir.path(), false).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(MANIFEST_NAME)).unwrap();
+        assert!(text.contains("install-path  'my tool'  skill  ./out"));
+    }
+
+    #[test]
     fn cmd_format_dry_run_does_not_write() {
         let dir = tempfile::tempdir().unwrap();
         let original = "github  skill  z/repo  z.md\ngithub  skill  a/repo  a.md\n";

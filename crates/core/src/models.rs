@@ -341,7 +341,8 @@ impl InstallTarget {
                 entity_type,
                 path,
             } => format!(
-                "install-path  {tool_name}  {entity_type}  {}",
+                "install-path  {}  {entity_type}  {}",
+                quote_manifest_field(tool_name),
                 quote_manifest_field(path)
             ),
         }
@@ -618,6 +619,12 @@ mod tests {
             t.manifest_line(),
             "install-path  openclaw  skill  './custom skills'"
         );
+    }
+
+    #[test]
+    fn install_path_manifest_line_quotes_tool_name_when_needed() {
+        let t = InstallTarget::path("my tool", EntityType::Skill, "./out");
+        assert_eq!(t.manifest_line(), "install-path  'my tool'  skill  ./out");
     }
 
     #[test]
