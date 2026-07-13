@@ -281,9 +281,10 @@ pub fn fetch_github_file(
     } else {
         path_in_repo
     };
+    let encoded_path = encode_url_path(effective_path);
     let url = format!(
         "https://raw.githubusercontent.com/{}/{}/{}",
-        gh.owner_repo, gh.ref_, effective_path
+        gh.owner_repo, gh.ref_, encoded_path
     );
     http_get(gh.client, &url)
 }
@@ -2873,5 +2874,16 @@ mod tests {
         assert!(entries
             .iter()
             .any(|entry| entry.relative_path == "final.md"));
+    }
+    #[test]
+    fn test_encode_url_path_with_space() {
+        let result = encode_url_path("my skill.md");
+        assert_eq!(result, "my%20skill.md");
+    }
+
+    #[test]
+    fn test_encode_url_path_with_hash() {
+        let result = encode_url_path("my#skill.md");
+        assert_eq!(result, "my%23skill.md");
     }
 }
