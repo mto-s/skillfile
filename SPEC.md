@@ -54,6 +54,20 @@ install  <platform>  <scope>
 
 Multiple install lines are allowed (one per platform+scope combination). Duplicate install targets produce a warning during validation.
 
+### Explicit Path Targets
+
+```
+install-path  <tool-name>  <entity-type>  <path>
+```
+
+| Field | Values | Description |
+|---|---|---|
+| `tool-name` | any non-empty string | Label used in status and install output |
+| `entity-type` | `skill`, `agent` | Which kind of entry this target accepts |
+| `path` | filesystem path | Exact destination directory; `~` expands to `$HOME`, relative paths are resolved from the repo root |
+
+Each `install-path` line defines one destination for one entity type. Default directory mode is `nested` for skills and `flat` for agents. Multiple explicit path targets are allowed. Duplicate targets for the same entity type and destination path fail validation.
+
 ## Entry Lines
 
 ### Local

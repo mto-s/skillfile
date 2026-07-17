@@ -3,7 +3,7 @@ use std::path::Path;
 
 use skillfile_core::error::SkillfileError;
 use skillfile_core::models::{Entry, Manifest};
-use skillfile_deploy::adapter::{adapters, AdapterScope};
+use skillfile_deploy::target::ResolvedInstallTarget;
 
 pub(crate) struct SingleFileVariant {
     pub(crate) label: String,
@@ -20,24 +20,17 @@ pub(crate) fn installed_single_file_variants(
     manifest: &Manifest,
     repo_root: &Path,
 ) -> Result<Vec<SingleFileVariant>, SkillfileError> {
-    let all_adapters = adapters();
     let mut variants = Vec::new();
 
     for target in &manifest.install_targets {
-        let Some(adapter) = all_adapters.get(&target.adapter) else {
+        let Ok(resolved) = ResolvedInstallTarget::from_target(target) else {
             continue;
         };
-        if !adapter.supports(entry.entity_type) {
+        if !resolved.supports(entry.entity_type) {
             continue;
         }
 
-        let path = adapter.installed_path(
-            entry,
-            &AdapterScope {
-                scope: target.scope,
-                repo_root,
-            },
-        );
+        let path = resolved.installed_path(entry, repo_root);
         if !path.exists() {
             continue;
         }
@@ -56,24 +49,17 @@ pub(crate) fn installed_dir_variants(
     manifest: &Manifest,
     repo_root: &Path,
 ) -> Vec<DirVariant> {
-    let all_adapters = adapters();
     let mut variants = Vec::new();
 
     for target in &manifest.install_targets {
-        let Some(adapter) = all_adapters.get(&target.adapter) else {
+        let Ok(resolved) = ResolvedInstallTarget::from_target(target) else {
             continue;
         };
-        if !adapter.supports(entry.entity_type) {
+        if !resolved.supports(entry.entity_type) {
             continue;
         }
 
-        let files = adapter.installed_dir_files(
-            entry,
-            &AdapterScope {
-                scope: target.scope,
-                repo_root,
-            },
-        );
+        let files = resolved.installed_dir_files(entry, repo_root);
         if files.is_empty() {
             continue;
         }

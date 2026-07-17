@@ -445,7 +445,7 @@ fn format_keeps_spaced_local_path_valid() {
     sf(dir.path()).arg("validate").assert().success();
 
     let text = std::fs::read_to_string(dir.path().join("Skillfile")).unwrap();
-    assert!(text.contains("local  skill  commit  \"my skills/git commit.md\""));
+    assert!(text.contains("local  skill  commit  'my skills/git commit.md'"));
 }
 
 // ---------------------------------------------------------------------------
@@ -481,7 +481,7 @@ fn add_keeps_spaced_local_path_valid() {
     sf(dir.path()).arg("validate").assert().success();
 
     let text = std::fs::read_to_string(dir.path().join("Skillfile")).unwrap();
-    assert!(text.contains("local  skill  commit  \"my skills/git commit.md\""));
+    assert!(text.contains("local  skill  commit  'my skills/git commit.md'"));
 }
 
 #[test]

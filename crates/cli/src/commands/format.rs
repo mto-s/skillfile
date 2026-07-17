@@ -6,6 +6,7 @@ use skillfile_core::parser::{parse_manifest, MANIFEST_NAME};
 use skillfile_sources::strategy::format_parts;
 
 const INSTALL_COMMENT: &str = "# install  <platform>  <scope>";
+const INSTALL_PATH_COMMENT: &str = "# install-path  <tool-name>  <entity-type>  <path>";
 
 fn section_headers(entity_type: &str) -> Vec<&'static str> {
     match entity_type {
@@ -92,7 +93,11 @@ fn extract_entry_comments(raw_text: &str) -> std::collections::HashMap<String, V
             pending.push(line.trim_end().to_string());
             continue;
         }
-        if stripped.is_empty() || stripped.starts_with("install") {
+        if stripped.is_empty() || stripped.starts_with("install ") || stripped == "install" {
+            pending.clear();
+            continue;
+        }
+        if stripped.starts_with("install-path ") || stripped == "install-path" {
             pending.clear();
             continue;
         }
@@ -134,9 +139,23 @@ pub fn sorted_manifest_text(manifest: &Manifest, raw_text: &str) -> String {
 
     // Install targets section
     if !manifest.install_targets.is_empty() {
-        lines.push(INSTALL_COMMENT.to_string());
+        if manifest.install_targets.iter().any(|target| {
+            matches!(
+                target,
+                skillfile_core::models::InstallTarget::Platform { .. }
+            )
+        }) {
+            lines.push(INSTALL_COMMENT.to_string());
+        }
+        if manifest
+            .install_targets
+            .iter()
+            .any(|target| matches!(target, skillfile_core::models::InstallTarget::Path { .. }))
+        {
+            lines.push(INSTALL_PATH_COMMENT.to_string());
+        }
         for target in &manifest.install_targets {
-            lines.push(format!("install  {}  {}", target.adapter, target.scope));
+            lines.push(target.manifest_line());
         }
     }
 
@@ -224,10 +243,7 @@ mod tests {
     }
 
     fn itarget(adapter: &str, scope: Scope) -> InstallTarget {
-        InstallTarget {
-            adapter: adapter.into(),
-            scope,
-        }
+        InstallTarget::platform(adapter, scope)
     }
 
     #[test]
@@ -382,6 +398,15 @@ mod tests {
     }
 
     #[test]
+    fn cmd_format_preserves_quoted_install_path_tool_name() {
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(dir.path(), "install-path  \"my tool\"  skill  ./out\n");
+        cmd_format(dir.path(), false).unwrap();
+        let text = std::fs::read_to_string(dir.path().join(MANIFEST_NAME)).unwrap();
+        assert!(text.contains("install-path  'my tool'  skill  ./out"));
+    }
+
+    #[test]
     fn cmd_format_preserves_quoted_local_path() {
         let dir = tempfile::tempdir().unwrap();
         write_manifest(
@@ -392,7 +417,34 @@ mod tests {
         cmd_format(dir.path(), false).unwrap();
 
         let text = std::fs::read_to_string(dir.path().join(MANIFEST_NAME)).unwrap();
-        assert!(text.contains("local  skill  commit  \"my skills/git commit.md\""));
+        assert!(text.contains("local  skill  commit  'my skills/git commit.md'"));
+    }
+
+    #[test]
+    fn cmd_format_round_trips_shell_sensitive_local_paths() {
+        for (name, quoted_path, expected_path) in [
+            ("windows", r"'C:\skills\win.md'", r"C:\skills\win.md"),
+            ("single-quote", r#""skills/it's.md""#, "skills/it's.md"),
+            (
+                "double-quote",
+                r#"'skills/"quoted".md'"#,
+                r#"skills/"quoted".md"#,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            write_manifest(
+                dir.path(),
+                &format!("local  skill  {name}  {quoted_path}\n"),
+            );
+
+            cmd_format(dir.path(), false).unwrap();
+
+            let result = parse_manifest(&dir.path().join(MANIFEST_NAME)).unwrap();
+            assert_eq!(
+                result.manifest.entries[0].source.as_local(),
+                Some(expected_path)
+            );
+        }
     }
 
     #[test]

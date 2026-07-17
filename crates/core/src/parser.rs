@@ -40,59 +40,46 @@ fn is_valid_name(name: &str) -> bool {
             .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
 }
 
-fn flush_token(current: &mut String, parts: &mut Vec<String>) {
-    if !current.is_empty() {
-        parts.push(std::mem::take(current));
-    }
-}
-
-/// Split a manifest line respecting double-quoted fields.
+/// Split a manifest line using shell-style field quoting.
 ///
 /// Unquoted lines split identically to whitespace split.
-/// Double-quoted fields preserve internal spaces.
-fn split_line(line: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut in_quotes = false;
-
-    for ch in line.chars() {
-        if ch == '"' {
-            in_quotes = !in_quotes;
-            continue;
-        }
-        if ch.is_whitespace() && !in_quotes {
-            flush_token(&mut current, &mut parts);
-            continue;
-        }
-        current.push(ch);
-    }
-    flush_token(&mut current, &mut parts);
-    parts
+/// Quoted fields preserve internal spaces and comment markers.
+fn split_line(line: &str) -> Option<Vec<String>> {
+    shlex::split(line)
 }
 
 fn strip_inline_comment(line: &str) -> &str {
-    let mut in_quotes = false;
+    let mut quote = None;
+    let mut escaped = false;
     let mut previous_was_whitespace = false;
 
     for (index, ch) in line.char_indices() {
-        if ch == '"' {
-            in_quotes = !in_quotes;
-        } else if ch == '#' && !in_quotes && previous_was_whitespace {
-            return line[..index].trim_end();
+        if escaped {
+            escaped = false;
+            previous_was_whitespace = false;
+            continue;
         }
-        previous_was_whitespace = ch.is_whitespace();
+        match quote {
+            Some(active) if ch == active => quote = None,
+            Some('"') | None if ch == '\\' => escaped = true,
+            None if ch == '\'' || ch == '"' => quote = Some(ch),
+            None if ch == '#' && previous_was_whitespace => {
+                return line[..index].trim_end();
+            }
+            Some(_) | None => {}
+        }
+        previous_was_whitespace = quote.is_none() && ch.is_whitespace();
     }
 
     line
 }
 
-/// Quote a manifest field when the parser would otherwise split or comment it out.
+/// Quote a manifest field so shell-style parsing recovers the original value.
 #[must_use]
 pub fn quote_field(field: &str) -> String {
-    if field.chars().any(char::is_whitespace) || field.contains('#') {
-        format!("\"{field}\"")
-    } else {
-        field.to_string()
+    match shlex::try_quote(field) {
+        Ok(quoted) => quoted.into_owned(),
+        Err(_) => field.to_string(),
     }
 }
 
@@ -120,7 +107,11 @@ pub fn resolve_explicit_owner_repo_ref(
     at_ref: Option<String>,
     positional_ref: Option<&str>,
 ) -> Option<String> {
-    at_ref.or_else(|| positional_ref.map(String::from))
+    at_ref.filter(|ref_| !ref_.trim().is_empty()).or_else(|| {
+        positional_ref
+            .filter(|ref_| !ref_.trim().is_empty())
+            .map(String::from)
+    })
 }
 
 /// Resolve the effective ref from the `@`-syntax parsed ref and an explicit positional ref.
@@ -146,6 +137,17 @@ fn parse_github_owner_repo(
          — expected 'owner/repo' or 'owner/repo@ref' format"
     ));
     None
+}
+
+fn validate_repo_path(path: &str, source_type: &str, lineno: usize) -> Result<(), String> {
+    let path = path.trim();
+    if path == "." || Path::new(path).file_name().is_some() {
+        return Ok(());
+    }
+    Err(format!(
+        "warning: line {lineno}: {source_type} entry has invalid repository path '{path}' \
+         — expected a non-root path or '.'"
+    ))
 }
 
 /// Parse a github entry line. parts[0]=source_type, parts[1]=entity_type, etc.
@@ -187,6 +189,11 @@ fn parse_github_entry(
         (parts[2].clone(), parsed_repo, &parts[4], ref_)
     };
 
+    if let Err(warning) = validate_repo_path(path_in_repo, "github", lineno) {
+        warnings.push(warning);
+        return (None, warnings);
+    }
+
     let entry = Entry {
         entity_type,
         name,
@@ -214,7 +221,7 @@ fn parse_gitlab_entry(
             ));
             return (None, warnings);
         }
-        let ref_ = parts.get(4).map_or(DEFAULT_REF, String::as_str);
+        let ref_ = resolve_owner_repo_ref(None, parts.get(4).map(String::as_str));
         (infer_name(&parts[3]), &parts[2], &parts[3], ref_)
     } else {
         if parts.len() < 5 {
@@ -231,9 +238,14 @@ fn parse_gitlab_entry(
             ));
             return (None, warnings);
         }
-        let ref_ = parts.get(5).map_or(DEFAULT_REF, String::as_str);
+        let ref_ = resolve_owner_repo_ref(None, parts.get(5).map(String::as_str));
         (parts[2].clone(), &parts[3], &parts[4], ref_)
     };
+
+    if let Err(warning) = validate_repo_path(path_in_repo, "gitlab", lineno) {
+        warnings.push(warning);
+        return (None, warnings);
+    }
 
     let entry = Entry {
         entity_type,
@@ -241,15 +253,17 @@ fn parse_gitlab_entry(
         source: SourceFields::Gitlab {
             owner_repo: owner_repo.clone(),
             path_in_repo: path_in_repo.clone(),
-            ref_: ref_.to_owned(),
+            ref_,
         },
     };
     (Some(entry), warnings)
 }
 
-fn parse_local_entry(parts: &[String], entity_type: EntityType) -> (Option<Entry>, Vec<String>) {
-    let warnings = Vec::new();
-
+fn parse_local_entry(
+    parts: &[String],
+    entity_type: EntityType,
+    lineno: usize,
+) -> (Option<Entry>, Vec<String>) {
     // Detection: if parts[2] ends in ".md" or contains '/' → path (inferred name).
     // With 4+ parts, parts[2] is always the explicit name and parts[3] the path.
     // With exactly 3 parts, parts[2] is always the path (even bare directory names
@@ -258,33 +272,29 @@ fn parse_local_entry(parts: &[String], entity_type: EntityType) -> (Option<Entry
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("md"))
         || parts[2].contains('/');
-    if looks_like_path || parts.len() < 4 {
-        let local_path = &parts[2];
-        let name = infer_name(local_path);
-        (
-            Some(Entry {
-                entity_type,
-                name,
-                source: SourceFields::Local {
-                    path: local_path.clone(),
-                },
-            }),
-            warnings,
-        )
+    let (name, local_path) = if looks_like_path || parts.len() < 4 {
+        (infer_name(&parts[2]), &parts[2])
     } else {
-        let name = &parts[2];
-        let local_path = &parts[3];
-        (
-            Some(Entry {
-                entity_type,
-                name: name.clone(),
-                source: SourceFields::Local {
-                    path: local_path.clone(),
-                },
-            }),
-            warnings,
-        )
+        (parts[2].clone(), &parts[3])
+    };
+    if local_path.trim().is_empty() {
+        return (
+            None,
+            vec![format!(
+                "warning: line {lineno}: local entry path must not be empty"
+            )],
+        );
     }
+    (
+        Some(Entry {
+            entity_type,
+            name,
+            source: SourceFields::Local {
+                path: local_path.clone(),
+            },
+        }),
+        Vec::new(),
+    )
 }
 
 fn parse_url_entry(
@@ -313,6 +323,12 @@ fn parse_url_entry(
         }
         let name = &parts[2];
         let url = &parts[3];
+        if url.trim().is_empty() {
+            warnings.push(format!(
+                "warning: line {lineno}: url entry URL must not be empty"
+            ));
+            return (None, warnings);
+        }
         (
             Some(Entry {
                 entity_type,
@@ -338,12 +354,17 @@ fn parse_install_line(parts: &[String], lineno: usize, acc: &mut ParseAccumulato
         ));
         return;
     }
+    let adapter = &parts[1];
+    if adapter.trim().is_empty() {
+        acc.warnings.push(format!(
+            "warning: line {lineno}: install adapter must not be empty"
+        ));
+        return;
+    }
     let scope_str = &parts[2];
     if let Some(scope) = Scope::parse(scope_str) {
-        acc.install_targets.push(InstallTarget {
-            adapter: parts[1].clone(),
-            scope,
-        });
+        acc.install_targets
+            .push(InstallTarget::platform(adapter.clone(), scope));
     } else {
         let valid: Vec<&str> = Scope::ALL
             .iter()
@@ -355,6 +376,51 @@ fn parse_install_line(parts: &[String], lineno: usize, acc: &mut ParseAccumulato
             valid.join(", ")
         ));
     }
+}
+
+fn parse_install_path_line(parts: &[String], lineno: usize, acc: &mut ParseAccumulator) {
+    if parts.len() < 4 {
+        acc.warnings.push(format!(
+            "warning: line {lineno}: install-path line needs: tool-name entity-type path"
+        ));
+        return;
+    }
+
+    let tool_name = &parts[1];
+    if tool_name.trim().is_empty() {
+        acc.warnings.push(format!(
+            "warning: line {lineno}: install-path tool-name must not be empty"
+        ));
+        return;
+    }
+
+    let entity_type_str = &parts[2];
+    let Some(entity_type) = EntityType::parse(entity_type_str) else {
+        let valid: Vec<&str> = EntityType::ALL
+            .iter()
+            .map(super::models::EntityType::as_str)
+            .collect();
+        acc.warnings.push(format!(
+            "warning: line {lineno}: invalid entity type '{entity_type_str}', \
+             must be one of: {}",
+            valid.join(", ")
+        ));
+        return;
+    };
+
+    let path = &parts[3];
+    if path.trim().is_empty() {
+        acc.warnings.push(format!(
+            "warning: line {lineno}: install-path path must not be empty"
+        ));
+        return;
+    }
+
+    acc.install_targets.push(InstallTarget::path(
+        tool_name.clone(),
+        entity_type,
+        path.clone(),
+    ));
 }
 
 fn validate_and_push_entry(entry: Entry, lineno: usize, acc: &mut ParseAccumulator) {
@@ -399,7 +465,7 @@ fn parse_source_entry(
     match source_type {
         "github" => parse_github_entry(parts, entity_type, lineno),
         "gitlab" => parse_gitlab_entry(parts, entity_type, lineno),
-        "local" => parse_local_entry(parts, entity_type),
+        "local" => parse_local_entry(parts, entity_type, lineno),
         "url" => parse_url_entry(parts, entity_type, lineno),
         _ => (None, vec![]),
     }
@@ -438,7 +504,11 @@ pub fn parse_manifest(manifest_path: &Path) -> Result<ParseResult, SkillfileErro
             continue;
         }
 
-        let parts = split_line(strip_inline_comment(line));
+        let Some(parts) = split_line(strip_inline_comment(line)) else {
+            acc.warnings
+                .push(format!("warning: line {lineno}: invalid quoting, skipping"));
+            continue;
+        };
         if parts.len() < 2 {
             acc.warnings
                 .push(format!("warning: line {lineno}: too few fields, skipping"));
@@ -447,6 +517,7 @@ pub fn parse_manifest(manifest_path: &Path) -> Result<ParseResult, SkillfileErro
 
         match parts[0].as_str() {
             "install" => parse_install_line(&parts, lineno, &mut acc),
+            "install-path" => parse_install_path_line(&parts, lineno, &mut acc),
             _ if KNOWN_SOURCES.contains(&parts[0].as_str()) => {
                 process_source_line(&parts, lineno, &mut acc);
             }
@@ -469,7 +540,7 @@ pub fn parse_manifest(manifest_path: &Path) -> Result<ParseResult, SkillfileErro
 
 #[must_use]
 pub fn parse_manifest_line(line: &str) -> Option<Entry> {
-    let parts = split_line(strip_inline_comment(line));
+    let parts = split_line(strip_inline_comment(line))?;
     if parts.len() < 3 {
         return None;
     }
@@ -481,7 +552,7 @@ pub fn parse_manifest_line(line: &str) -> Option<Entry> {
     let (entry_opt, _) = match source_type {
         "github" => parse_github_entry(&parts, entity_type, 0),
         "gitlab" => parse_gitlab_entry(&parts, entity_type, 0),
-        "local" => parse_local_entry(&parts, entity_type),
+        "local" => parse_local_entry(&parts, entity_type, 0),
         "url" => parse_url_entry(&parts, entity_type, 0),
         _ => return None,
     };
@@ -528,6 +599,60 @@ mod tests {
             .join("\n");
         fs::write(&p, dedented.trim_start_matches('\n').to_string() + "\n").unwrap();
         p
+    }
+
+    fn assert_repo_path_rejected(source_type: &str, path: &str) {
+        for line in [
+            format!("{source_type}  skill  owner/repo  {path}"),
+            format!("{source_type}  skill  named  owner/repo  {path}"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = write_manifest(dir.path(), &line);
+            let r = parse_manifest(&p).unwrap();
+            assert!(r.manifest.entries.is_empty(), "accepted: {line}");
+            assert!(
+                r.warnings.iter().any(|warning| warning
+                    .contains(&format!("{source_type} entry has invalid repository path"))),
+                "missing warning for: {line}"
+            );
+        }
+    }
+
+    fn assert_dot_repo_path_preserved(source_type: &str) {
+        for line in [
+            format!("{source_type}  skill  owner/repo  ."),
+            format!("{source_type}  skill  named  owner/repo  ."),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = write_manifest(dir.path(), &line);
+            let r = parse_manifest(&p).unwrap();
+            assert_eq!(r.manifest.entries.len(), 1, "rejected: {line}");
+            assert!(matches!(
+                &r.manifest.entries[0].source,
+                SourceFields::Github { path_in_repo, .. }
+                    | SourceFields::Gitlab { path_in_repo, .. }
+                    if path_in_repo == "."
+            ));
+        }
+    }
+
+    fn assert_empty_repo_ref_defaults_to_main(source_type: &str) {
+        for line in [
+            format!("{source_type}  skill  owner/repo  path  \"\""),
+            format!("{source_type}  skill  named  owner/repo  path  \"\""),
+            format!("{source_type}  skill  owner/repo  path  \"   \""),
+            format!("{source_type}  skill  named  owner/repo  path  \"   \""),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = write_manifest(dir.path(), &line);
+            let r = parse_manifest(&p).unwrap();
+            assert_eq!(r.manifest.entries.len(), 1, "rejected: {line}");
+            assert!(matches!(
+                &r.manifest.entries[0].source,
+                SourceFields::Github { ref_, .. } | SourceFields::Gitlab { ref_, .. }
+                    if ref_ == DEFAULT_REF
+            ));
+        }
     }
 
     // -------------------------------------------------------------------
@@ -672,6 +797,71 @@ mod tests {
         assert_eq!(r.manifest.entries[0].ref_(), "main");
     }
 
+    #[test]
+    fn repository_sources_reject_empty_and_root_only_paths() {
+        for (source_type, path) in [
+            ("github", "\"\""),
+            ("github", "\"   \""),
+            ("github", "/"),
+            ("github", "//"),
+            ("github", "/./"),
+            ("gitlab", "\"\""),
+            ("gitlab", "\"   \""),
+            ("gitlab", "/"),
+            ("gitlab", "//"),
+            ("gitlab", "/./"),
+        ] {
+            assert_repo_path_rejected(source_type, path);
+        }
+    }
+
+    #[test]
+    fn repository_sources_preserve_dot_root_path() {
+        for source_type in ["github", "gitlab"] {
+            assert_dot_repo_path_preserved(source_type);
+        }
+    }
+
+    #[test]
+    fn repository_sources_default_empty_refs() {
+        for source_type in ["github", "gitlab"] {
+            assert_empty_repo_ref_defaults_to_main(source_type);
+        }
+    }
+
+    #[test]
+    fn empty_source_and_install_fields_are_rejected() {
+        for (line, warning) in [
+            ("local  skill  \"\"", "local entry path must not be empty"),
+            (
+                "local  skill  named  \"   \"",
+                "local entry path must not be empty",
+            ),
+            ("url  skill  named  \"\"", "url entry URL must not be empty"),
+            (
+                "install  \"   \"  global",
+                "install adapter must not be empty",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = write_manifest(dir.path(), line);
+            let result = parse_manifest(&p).unwrap();
+
+            assert!(result.manifest.entries.is_empty(), "accepted: {line}");
+            assert!(
+                result.manifest.install_targets.is_empty(),
+                "accepted: {line}"
+            );
+            assert!(
+                result
+                    .warnings
+                    .iter()
+                    .any(|message| message.contains(warning)),
+                "missing warning for: {line}"
+            );
+        }
+    }
+
     // -------------------------------------------------------------------
     // @-syntax ref (owner/repo@ref)
     // -------------------------------------------------------------------
@@ -778,8 +968,7 @@ mod tests {
         let r = parse_manifest(&p).unwrap();
         assert_eq!(r.manifest.install_targets.len(), 1);
         let t = &r.manifest.install_targets[0];
-        assert_eq!(t.adapter, "claude-code");
-        assert_eq!(t.scope, Scope::Global);
+        assert_eq!(t, &InstallTarget::platform("claude-code", Scope::Global));
     }
 
     #[test]
@@ -791,8 +980,29 @@ mod tests {
         );
         let r = parse_manifest(&p).unwrap();
         assert_eq!(r.manifest.install_targets.len(), 2);
-        assert_eq!(r.manifest.install_targets[0].scope, Scope::Global);
-        assert_eq!(r.manifest.install_targets[1].scope, Scope::Local);
+        assert_eq!(
+            r.manifest.install_targets[0],
+            InstallTarget::platform("claude-code", Scope::Global)
+        );
+        assert_eq!(
+            r.manifest.install_targets[1],
+            InstallTarget::platform("claude-code", Scope::Local)
+        );
+    }
+
+    #[test]
+    fn install_path_target_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_manifest(
+            dir.path(),
+            "install-path  openclaw  skill  ~/.openclaw/skills",
+        );
+        let r = parse_manifest(&p).unwrap();
+        assert_eq!(r.manifest.install_targets.len(), 1);
+        assert_eq!(
+            r.manifest.install_targets[0],
+            InstallTarget::path("openclaw", EntityType::Skill, "~/.openclaw/skills")
+        );
     }
 
     #[test]
@@ -865,7 +1075,25 @@ mod tests {
         let p = write_manifest(dir.path(), "install  claude-code  global  # primary target");
         let r = parse_manifest(&p).unwrap();
         assert_eq!(r.manifest.install_targets.len(), 1);
-        assert_eq!(r.manifest.install_targets[0].scope, Scope::Global);
+        assert_eq!(
+            r.manifest.install_targets[0],
+            InstallTarget::platform("claude-code", Scope::Global)
+        );
+    }
+
+    #[test]
+    fn inline_comment_on_install_path_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_manifest(
+            dir.path(),
+            "install-path  misc-target  agent  ./agents  # custom target",
+        );
+        let r = parse_manifest(&p).unwrap();
+        assert_eq!(r.manifest.install_targets.len(), 1);
+        assert_eq!(
+            r.manifest.install_targets[0],
+            InstallTarget::path("misc-target", EntityType::Agent, "./agents")
+        );
     }
 
     #[test]
@@ -919,6 +1147,16 @@ mod tests {
         assert_eq!(r.manifest.entries.len(), 1);
         assert_eq!(r.manifest.entries[0].name, "hash-skill");
         assert_eq!(r.manifest.entries[0].local_path(), "#skills/hash.md");
+    }
+
+    #[test]
+    fn single_quoted_hash_path_is_not_an_inline_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(MANIFEST_NAME);
+        fs::write(&p, "local  skill  hash-skill  'my #skills/hash.md'\n").unwrap();
+        let r = parse_manifest(&p).unwrap();
+        assert_eq!(r.manifest.entries.len(), 1);
+        assert_eq!(r.manifest.entries[0].local_path(), "my #skills/hash.md");
     }
 
     #[test]
@@ -998,7 +1236,10 @@ mod tests {
             let p = write_manifest(dir.path(), &format!("install  claude-code  {scope_str}"));
             let r = parse_manifest(&p).unwrap();
             assert_eq!(r.manifest.install_targets.len(), 1);
-            assert_eq!(r.manifest.install_targets[0].scope, *expected);
+            assert_eq!(
+                r.manifest.install_targets[0],
+                InstallTarget::platform("claude-code", *expected)
+            );
         }
     }
 
@@ -1012,6 +1253,33 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.to_lowercase().contains("scope") || w.to_lowercase().contains("warning")));
+    }
+
+    #[test]
+    fn invalid_install_path_entity_type_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_manifest(dir.path(), "install-path  misc-target  bot  ./target");
+        let r = parse_manifest(&p).unwrap();
+        assert!(r.manifest.install_targets.is_empty());
+        assert!(r.warnings.iter().any(|w| w.contains("invalid entity type")));
+    }
+
+    #[test]
+    fn empty_install_path_tool_name_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_manifest(dir.path(), "install-path  \"\"  skill  ./target");
+        let r = parse_manifest(&p).unwrap();
+        assert!(r.manifest.install_targets.is_empty());
+        assert!(r.warnings.iter().any(|w| w.contains("tool-name")));
+    }
+
+    #[test]
+    fn empty_install_path_path_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_manifest(dir.path(), "install-path  misc-target  skill  \"\"");
+        let r = parse_manifest(&p).unwrap();
+        assert!(r.manifest.install_targets.is_empty());
+        assert!(r.warnings.iter().any(|w| w.contains("path")));
     }
 
     // -------------------------------------------------------------------
@@ -1048,10 +1316,7 @@ mod tests {
         assert_eq!(r.manifest.install_targets.len(), 1);
         assert_eq!(
             r.manifest.install_targets[0],
-            InstallTarget {
-                adapter: "claude-code".into(),
-                scope: Scope::Global,
-            }
+            InstallTarget::platform("claude-code", Scope::Global)
         );
     }
 
@@ -1089,8 +1354,8 @@ mod tests {
             &p,
             [
                 240, 174, 174, 174, 240, 174, 174, 170, 240, 105, 116, 104, 117, 97, 10, 103, 105,
-                116, 104, 117, 98, 12, 97, 103, 101, 110, 116, 12, 117, 115, 64, 116, 97, 108, 170,
-                170, 115, 47, 108, 1, 57, 12, 108, 12, 59, 239, 191, 10,
+                116, 104, 117, 98, 32, 97, 103, 101, 110, 116, 32, 117, 115, 64, 116, 97, 108, 170,
+                170, 115, 47, 108, 1, 57, 32, 108, 32, 59, 239, 191, 10,
             ],
         )
         .unwrap();
@@ -1151,7 +1416,7 @@ mod tests {
     #[test]
     fn split_line_simple() {
         assert_eq!(
-            split_line("github  agent  owner/repo  agent.md"),
+            split_line("github  agent  owner/repo  agent.md").unwrap(),
             vec!["github", "agent", "owner/repo", "agent.md"]
         );
     }
@@ -1159,15 +1424,47 @@ mod tests {
     #[test]
     fn split_line_quoted() {
         assert_eq!(
-            split_line("local  skill  \"my dir/foo.md\""),
+            split_line("local  skill  \"my dir/foo.md\"").unwrap(),
             vec!["local", "skill", "my dir/foo.md"]
         );
     }
 
     #[test]
+    fn split_line_single_quoted() {
+        assert_eq!(
+            split_line("local  skill  'my dir/foo.md'").unwrap(),
+            vec!["local", "skill", "my dir/foo.md"]
+        );
+    }
+
+    #[test]
+    fn quote_field_round_trips_shell_sensitive_values() {
+        for field in [
+            r"C:\skills\win.md",
+            "skills/it's.md",
+            r#"skills/"quoted".md"#,
+            "skills/my dir/#skill.md",
+        ] {
+            assert_eq!(
+                split_line(&quote_field(field)),
+                Some(vec![field.to_string()])
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_quoting_warns_and_skips_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_manifest(dir.path(), "local  skill  \"unterminated.md");
+        let r = parse_manifest(&p).unwrap();
+        assert!(r.manifest.entries.is_empty());
+        assert!(r.warnings.iter().any(|w| w.contains("invalid quoting")));
+    }
+
+    #[test]
     fn split_line_tabs() {
         assert_eq!(
-            split_line("local\tskill\tfoo.md"),
+            split_line("local\tskill\tfoo.md").unwrap(),
             vec!["local", "skill", "foo.md"]
         );
     }

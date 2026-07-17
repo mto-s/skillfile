@@ -264,16 +264,108 @@ impl fmt::Display for Entry {
 // InstallTarget
 // ---------------------------------------------------------------------------
 
-/// An install target line from the Skillfile: `install <adapter> <scope>`.
+/// An install target line from the Skillfile.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstallTarget {
-    pub adapter: String,
-    pub scope: Scope,
+pub enum InstallTarget {
+    Platform {
+        adapter: String,
+        scope: Scope,
+    },
+    Path {
+        tool_name: String,
+        entity_type: EntityType,
+        path: String,
+    },
+}
+
+impl InstallTarget {
+    #[must_use]
+    pub fn platform(adapter: impl Into<String>, scope: Scope) -> Self {
+        Self::Platform {
+            adapter: adapter.into(),
+            scope,
+        }
+    }
+
+    #[must_use]
+    pub fn path(
+        tool_name: impl Into<String>,
+        entity_type: EntityType,
+        path: impl Into<String>,
+    ) -> Self {
+        Self::Path {
+            tool_name: tool_name.into(),
+            entity_type,
+            path: path.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn platform_name(&self) -> &str {
+        match self {
+            Self::Platform { adapter, .. } => adapter,
+            Self::Path { tool_name, .. } => tool_name,
+        }
+    }
+
+    #[must_use]
+    pub fn scope(&self) -> Option<Scope> {
+        match self {
+            Self::Platform { scope, .. } => Some(*scope),
+            Self::Path { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn entity_type(&self) -> Option<EntityType> {
+        match self {
+            Self::Platform { .. } => None,
+            Self::Path { entity_type, .. } => Some(*entity_type),
+        }
+    }
+
+    #[must_use]
+    pub fn path_str(&self) -> Option<&str> {
+        match self {
+            Self::Platform { .. } => None,
+            Self::Path { path, .. } => Some(path),
+        }
+    }
+
+    #[must_use]
+    pub fn manifest_line(&self) -> String {
+        match self {
+            Self::Platform { adapter, scope } => format!("install  {adapter}  {scope}"),
+            Self::Path {
+                tool_name,
+                entity_type,
+                path,
+            } => format!(
+                "install-path  {}  {entity_type}  {}",
+                quote_manifest_field(tool_name),
+                quote_manifest_field(path)
+            ),
+        }
+    }
+}
+
+fn quote_manifest_field(value: &str) -> String {
+    match shlex::try_quote(value) {
+        Ok(quoted) => quoted.into_owned(),
+        Err(_) => value.to_string(),
+    }
 }
 
 impl fmt::Display for InstallTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} ({})", self.adapter, self.scope)
+        match self {
+            Self::Platform { adapter, scope } => write!(f, "{adapter} ({scope})"),
+            Self::Path {
+                tool_name,
+                entity_type,
+                path,
+            } => write!(f, "{tool_name} {entity_type} ({path})"),
+        }
     }
 }
 
@@ -505,13 +597,52 @@ mod tests {
 
     #[test]
     fn install_target_with_scope_enum() {
-        let t = InstallTarget {
-            adapter: "claude-code".into(),
-            scope: Scope::Global,
-        };
-        assert_eq!(t.adapter, "claude-code");
-        assert_eq!(t.scope, Scope::Global);
+        let t = InstallTarget::platform("claude-code", Scope::Global);
+        assert_eq!(t.platform_name(), "claude-code");
+        assert_eq!(t.scope(), Some(Scope::Global));
         assert_eq!(t.to_string(), "claude-code (global)");
+    }
+
+    #[test]
+    fn install_path_target_fields() {
+        let t = InstallTarget::path("openclaw", EntityType::Skill, "~/.openclaw/skills");
+        assert_eq!(t.platform_name(), "openclaw");
+        assert_eq!(t.entity_type(), Some(EntityType::Skill));
+        assert_eq!(t.path_str(), Some("~/.openclaw/skills"));
+        assert_eq!(t.to_string(), "openclaw skill (~/.openclaw/skills)");
+    }
+
+    #[test]
+    fn install_path_manifest_line_quotes_path_when_needed() {
+        let t = InstallTarget::path("openclaw", EntityType::Skill, "./custom skills");
+        assert_eq!(
+            t.manifest_line(),
+            "install-path  openclaw  skill  './custom skills'"
+        );
+    }
+
+    #[test]
+    fn install_path_manifest_line_quotes_tool_name_when_needed() {
+        let t = InstallTarget::path("my tool", EntityType::Skill, "./out");
+        assert_eq!(t.manifest_line(), "install-path  'my tool'  skill  ./out");
+    }
+
+    #[test]
+    fn install_path_manifest_line_quotes_hash_path() {
+        let t = InstallTarget::path("openclaw", EntityType::Skill, "./skills#custom");
+        assert_eq!(
+            t.manifest_line(),
+            "install-path  openclaw  skill  './skills#custom'"
+        );
+    }
+
+    #[test]
+    fn install_path_manifest_line_quotes_embedded_double_quote() {
+        let t = InstallTarget::path("openclaw", EntityType::Skill, "./custom \"skills\"");
+        assert_eq!(
+            t.manifest_line(),
+            "install-path  openclaw  skill  './custom \"skills\"'"
+        );
     }
 
     #[test]
@@ -530,10 +661,7 @@ mod tests {
                 path: "test.md".into(),
             },
         };
-        let t = InstallTarget {
-            adapter: "claude-code".into(),
-            scope: Scope::Local,
-        };
+        let t = InstallTarget::platform("claude-code", Scope::Local);
         let m = Manifest {
             entries: vec![e],
             install_targets: vec![t],

@@ -335,7 +335,7 @@ mod tests {
         };
         assert_eq!(
             format_parts(&e),
-            vec!["git-commit", "\"my skills/git commit.md\""]
+            vec!["git-commit", "'my skills/git commit.md'"]
         );
     }
 
@@ -348,7 +348,7 @@ mod tests {
                 path: "#skills/hash.md".into(),
             },
         };
-        assert_eq!(format_parts(&e), vec!["hash-skill", "\"#skills/hash.md\""]);
+        assert_eq!(format_parts(&e), vec!["hash-skill", "'#skills/hash.md'"]);
     }
 
     #[test]
@@ -364,11 +364,7 @@ mod tests {
         };
         assert_eq!(
             format_parts(&github),
-            vec![
-                "owner/repo",
-                "\"path with spaces/skill.md\"",
-                "\"release #1\""
-            ]
+            vec!["owner/repo", "'path with spaces/skill.md'", "'release #1'"]
         );
 
         let gitlab = Entry {
@@ -382,7 +378,7 @@ mod tests {
         };
         assert_eq!(
             format_parts(&gitlab),
-            vec!["agent", "group/project", "\"agents/team agent.md\""]
+            vec!["agent", "group/project", "'agents/team agent.md'"]
         );
 
         let url = Entry {
@@ -394,7 +390,7 @@ mod tests {
         };
         assert_eq!(
             format_parts(&url),
-            vec!["remote", "\"https://example.com/skill.md#stable\""]
+            vec!["remote", "'https://example.com/skill.md#stable'"]
         );
     }
 

@@ -64,6 +64,8 @@ GitLab project paths may include subgroups. Self-hosted GitLab is supported thro
 ```text
 install  claude-code  global
 install  codex        global
+install-path  openclaw     skill  ~/.openclaw/skills
+install-path  misc-target  agent  ./local/path/to/agents
 
 github  skill  anthropics/skills  skills/slack-gif-creator
 gitlab  skill  my-group/platform-skills  skills/release
@@ -72,6 +74,8 @@ url     agent  triager  https://example.com/agents/triager.md
 ```
 
 Format details live in [SPEC.md](SPEC.md).
+
+Explicit path targets install skills as `<path>/<name>/SKILL.md` and agents as `<path>/<name>.md`.
 
 ## Common commands
 

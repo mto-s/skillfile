@@ -1,6 +1,6 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use skillfile_core::models::SourceFields;
+use skillfile_core::models::{InstallTarget, SourceFields};
 use std::collections::HashSet;
 use std::io::Write;
 
@@ -107,12 +107,25 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
-    // 4. Install target invariants — adapter and scope are well-formed.
+    // 4. Install target invariants — platform and path targets are well-formed.
     for target in &manifest.install_targets {
-        assert!(
-            !target.adapter.is_empty(),
-            "install target has empty adapter name",
-        );
+        match target {
+            InstallTarget::Platform { adapter, .. } => {
+                assert!(
+                    !adapter.is_empty(),
+                    "install target has empty adapter name",
+                );
+            }
+            InstallTarget::Path {
+                tool_name, path, ..
+            } => {
+                assert!(
+                    !tool_name.is_empty(),
+                    "install-path target has empty tool name",
+                );
+                assert!(!path.is_empty(), "install-path target has empty path");
+            }
+        }
     }
 
     // 5. Warnings are well-formed strings (non-empty, no panics during formatting).
