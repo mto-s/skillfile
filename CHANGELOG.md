@@ -6,6 +6,12 @@ All notable changes to skillfile are documented here.
 
 ## Unreleased
 
+## v1.8.0 - 17-07-2026
+
+### Added
+
+- **`skillfile list` command** - inspect declared skills, agents, source details, and install targets without reading lock/cache state or making network calls; filter by entity type, print names only, or emit JSON for scripts by @ebbsanchez and @clancyclaw
+
 ### Fixed
 
 - **Interactive add now rejects piped input instead of hanging** - bare `skillfile add` and bulk selection require stdin as well as stderr to be attached to a terminal before starting their interactive UI by @ychampion

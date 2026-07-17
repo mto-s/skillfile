@@ -78,6 +78,7 @@ Format details live in [SPEC.md](SPEC.md).
 ```bash
 skillfile init
 skillfile add
+skillfile list
 skillfile install
 skillfile install --update
 skillfile status
