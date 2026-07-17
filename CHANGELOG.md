@@ -6,6 +6,29 @@ All notable changes to skillfile are documented here.
 
 ## Unreleased
 
+## v1.8.0 - 17-07-2026
+
+### Added
+
+- **`skillfile list` command** - inspect declared skills, agents, source details, and install targets without reading lock/cache state or making network calls; filter by entity type, print names only, or emit JSON for scripts by @ebbsanchez and @clancyclaw
+
+### Fixed
+
+- **Interactive add now rejects piped input instead of hanging** - bare `skillfile add` and bulk selection require stdin as well as stderr to be attached to a terminal before starting their interactive UI by @ychampion
+- **Formatting keeps quoted manifest fields valid** - `skillfile add` and `skillfile format` now preserve paths and other fields containing whitespace or `#` instead of rewriting them into a different entry by @ychampion
+- **Pinned files now keep stable modification status across line-ending styles** - patch round-trips preserve a missing final newline, and CRLF/LF differences no longer make a freshly pinned file appear modified by @ychampion
+
+## v1.7.4 - 13-07-2026
+
+### Changed
+
+- **Dependency refresh** - bumped `clap_complete` to 4.6.7.
+
+### Fixed
+
+- **Directory-entry keys now stay consistent during updates and patch application** - `skillfile install --update` preserves edits to nested files when cache paths use platform-native separators, and directory patches use the same portable keys as installed file maps by @ychampion
+- **GitHub single-file fetches now handle encoded paths correctly** - GitHub entries that point directly at files with spaces, `#`, or non-ASCII characters in their path now fetch the intended raw file instead of failing with an invalid URI error or requesting the wrong path by @humammoin09-blip
+
 ## v1.7.3 - 10-07-2026
 
 ### Fixed

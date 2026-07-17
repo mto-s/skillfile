@@ -48,11 +48,38 @@ fn split_line(line: &str) -> Option<Vec<String>> {
     shlex::split(line)
 }
 
-fn strip_inline_comment(parts: Vec<String>) -> Vec<String> {
-    if let Some(pos) = parts.iter().position(|p| p.starts_with('#')) {
-        parts[..pos].to_vec()
-    } else {
-        parts
+fn strip_inline_comment(line: &str) -> &str {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut previous_was_whitespace = false;
+
+    for (index, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            previous_was_whitespace = false;
+            continue;
+        }
+        match quote {
+            Some(active) if ch == active => quote = None,
+            Some('"') | None if ch == '\\' => escaped = true,
+            None if ch == '\'' || ch == '"' => quote = Some(ch),
+            None if ch == '#' && previous_was_whitespace => {
+                return line[..index].trim_end();
+            }
+            Some(_) | None => {}
+        }
+        previous_was_whitespace = quote.is_none() && ch.is_whitespace();
+    }
+
+    line
+}
+
+/// Quote a manifest field so shell-style parsing recovers the original value.
+#[must_use]
+pub fn quote_field(field: &str) -> String {
+    match shlex::try_quote(field) {
+        Ok(quoted) => quoted.into_owned(),
+        Err(_) => field.to_string(),
     }
 }
 
@@ -232,9 +259,11 @@ fn parse_gitlab_entry(
     (Some(entry), warnings)
 }
 
-fn parse_local_entry(parts: &[String], entity_type: EntityType) -> (Option<Entry>, Vec<String>) {
-    let warnings = Vec::new();
-
+fn parse_local_entry(
+    parts: &[String],
+    entity_type: EntityType,
+    lineno: usize,
+) -> (Option<Entry>, Vec<String>) {
     // Detection: if parts[2] ends in ".md" or contains '/' → path (inferred name).
     // With 4+ parts, parts[2] is always the explicit name and parts[3] the path.
     // With exactly 3 parts, parts[2] is always the path (even bare directory names
@@ -243,33 +272,29 @@ fn parse_local_entry(parts: &[String], entity_type: EntityType) -> (Option<Entry
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("md"))
         || parts[2].contains('/');
-    if looks_like_path || parts.len() < 4 {
-        let local_path = &parts[2];
-        let name = infer_name(local_path);
-        (
-            Some(Entry {
-                entity_type,
-                name,
-                source: SourceFields::Local {
-                    path: local_path.clone(),
-                },
-            }),
-            warnings,
-        )
+    let (name, local_path) = if looks_like_path || parts.len() < 4 {
+        (infer_name(&parts[2]), &parts[2])
     } else {
-        let name = &parts[2];
-        let local_path = &parts[3];
-        (
-            Some(Entry {
-                entity_type,
-                name: name.clone(),
-                source: SourceFields::Local {
-                    path: local_path.clone(),
-                },
-            }),
-            warnings,
-        )
+        (parts[2].clone(), &parts[3])
+    };
+    if local_path.trim().is_empty() {
+        return (
+            None,
+            vec![format!(
+                "warning: line {lineno}: local entry path must not be empty"
+            )],
+        );
     }
+    (
+        Some(Entry {
+            entity_type,
+            name,
+            source: SourceFields::Local {
+                path: local_path.clone(),
+            },
+        }),
+        Vec::new(),
+    )
 }
 
 fn parse_url_entry(
@@ -298,6 +323,12 @@ fn parse_url_entry(
         }
         let name = &parts[2];
         let url = &parts[3];
+        if url.trim().is_empty() {
+            warnings.push(format!(
+                "warning: line {lineno}: url entry URL must not be empty"
+            ));
+            return (None, warnings);
+        }
         (
             Some(Entry {
                 entity_type,
@@ -323,10 +354,17 @@ fn parse_install_line(parts: &[String], lineno: usize, acc: &mut ParseAccumulato
         ));
         return;
     }
+    let adapter = &parts[1];
+    if adapter.trim().is_empty() {
+        acc.warnings.push(format!(
+            "warning: line {lineno}: install adapter must not be empty"
+        ));
+        return;
+    }
     let scope_str = &parts[2];
     if let Some(scope) = Scope::parse(scope_str) {
         acc.install_targets
-            .push(InstallTarget::platform(parts[1].clone(), scope));
+            .push(InstallTarget::platform(adapter.clone(), scope));
     } else {
         let valid: Vec<&str> = Scope::ALL
             .iter()
@@ -427,7 +465,7 @@ fn parse_source_entry(
     match source_type {
         "github" => parse_github_entry(parts, entity_type, lineno),
         "gitlab" => parse_gitlab_entry(parts, entity_type, lineno),
-        "local" => parse_local_entry(parts, entity_type),
+        "local" => parse_local_entry(parts, entity_type, lineno),
         "url" => parse_url_entry(parts, entity_type, lineno),
         _ => (None, vec![]),
     }
@@ -466,12 +504,11 @@ pub fn parse_manifest(manifest_path: &Path) -> Result<ParseResult, SkillfileErro
             continue;
         }
 
-        let Some(parts) = split_line(line) else {
+        let Some(parts) = split_line(strip_inline_comment(line)) else {
             acc.warnings
                 .push(format!("warning: line {lineno}: invalid quoting, skipping"));
             continue;
         };
-        let parts = strip_inline_comment(parts);
         if parts.len() < 2 {
             acc.warnings
                 .push(format!("warning: line {lineno}: too few fields, skipping"));
@@ -503,8 +540,7 @@ pub fn parse_manifest(manifest_path: &Path) -> Result<ParseResult, SkillfileErro
 
 #[must_use]
 pub fn parse_manifest_line(line: &str) -> Option<Entry> {
-    let parts = split_line(line)?;
-    let parts = strip_inline_comment(parts);
+    let parts = split_line(strip_inline_comment(line))?;
     if parts.len() < 3 {
         return None;
     }
@@ -516,7 +552,7 @@ pub fn parse_manifest_line(line: &str) -> Option<Entry> {
     let (entry_opt, _) = match source_type {
         "github" => parse_github_entry(&parts, entity_type, 0),
         "gitlab" => parse_gitlab_entry(&parts, entity_type, 0),
-        "local" => parse_local_entry(&parts, entity_type),
+        "local" => parse_local_entry(&parts, entity_type, 0),
         "url" => parse_url_entry(&parts, entity_type, 0),
         _ => return None,
     };
@@ -790,6 +826,39 @@ mod tests {
     fn repository_sources_default_empty_refs() {
         for source_type in ["github", "gitlab"] {
             assert_empty_repo_ref_defaults_to_main(source_type);
+        }
+    }
+
+    #[test]
+    fn empty_source_and_install_fields_are_rejected() {
+        for (line, warning) in [
+            ("local  skill  \"\"", "local entry path must not be empty"),
+            (
+                "local  skill  named  \"   \"",
+                "local entry path must not be empty",
+            ),
+            ("url  skill  named  \"\"", "url entry URL must not be empty"),
+            (
+                "install  \"   \"  global",
+                "install adapter must not be empty",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = write_manifest(dir.path(), line);
+            let result = parse_manifest(&p).unwrap();
+
+            assert!(result.manifest.entries.is_empty(), "accepted: {line}");
+            assert!(
+                result.manifest.install_targets.is_empty(),
+                "accepted: {line}"
+            );
+            assert!(
+                result
+                    .warnings
+                    .iter()
+                    .any(|message| message.contains(warning)),
+                "missing warning for: {line}"
+            );
         }
     }
 
@@ -1070,6 +1139,27 @@ mod tests {
     }
 
     #[test]
+    fn quoted_hash_path_is_not_an_inline_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(MANIFEST_NAME);
+        fs::write(&p, "local  skill  hash-skill  \"#skills/hash.md\"\n").unwrap();
+        let r = parse_manifest(&p).unwrap();
+        assert_eq!(r.manifest.entries.len(), 1);
+        assert_eq!(r.manifest.entries[0].name, "hash-skill");
+        assert_eq!(r.manifest.entries[0].local_path(), "#skills/hash.md");
+    }
+
+    #[test]
+    fn single_quoted_hash_path_is_not_an_inline_comment() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(MANIFEST_NAME);
+        fs::write(&p, "local  skill  hash-skill  'my #skills/hash.md'\n").unwrap();
+        let r = parse_manifest(&p).unwrap();
+        assert_eq!(r.manifest.entries.len(), 1);
+        assert_eq!(r.manifest.entries[0].local_path(), "my #skills/hash.md");
+    }
+
+    #[test]
     fn mixed_quoted_and_unquoted() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join(MANIFEST_NAME);
@@ -1345,6 +1435,21 @@ mod tests {
             split_line("local  skill  'my dir/foo.md'").unwrap(),
             vec!["local", "skill", "my dir/foo.md"]
         );
+    }
+
+    #[test]
+    fn quote_field_round_trips_shell_sensitive_values() {
+        for field in [
+            r"C:\skills\win.md",
+            "skills/it's.md",
+            r#"skills/"quoted".md"#,
+            "skills/my dir/#skill.md",
+        ] {
+            assert_eq!(
+                split_line(&quote_field(field)),
+                Some(vec![field.to_string()])
+            );
+        }
     }
 
     #[test]

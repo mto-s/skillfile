@@ -13,7 +13,8 @@ use skillfile_core::models::{
 use skillfile_core::parser::{parse_manifest, MANIFEST_NAME};
 use skillfile_core::patch::{
     apply_patch_pure, dir_patch_path, generate_patch, has_patch, patch_path, patches_root,
-    read_patch, remove_dir_patch, remove_patch, walkdir, write_dir_patch, write_patch,
+    read_patch, relative_file_key, remove_dir_patch, remove_patch, text_content_eq, walkdir,
+    write_dir_patch, write_patch,
 };
 use skillfile_core::progress;
 use skillfile_sources::strategy::{content_file, is_cached_dir_entry, is_dir_entry};
@@ -98,10 +99,8 @@ fn apply_dir_patches(
         .collect();
 
     for patch_file in patch_files {
-        let Some(rel) = patch_file
-            .strip_prefix(&patches_dir)
-            .ok()
-            .and_then(|p| p.to_str())
+        let Some(rel) = relative_file_key(&patches_dir, &patch_file)
+            .as_deref()
             .and_then(|s| s.strip_suffix(".patch"))
             .map(str::to_string)
         else {
@@ -127,8 +126,12 @@ fn apply_dir_patches(
         let new_patch = generate_patch(&cache_text, &patched, &rel);
         if new_patch.is_empty() {
             std::fs::remove_file(&patch_file)?;
-        } else {
-            write_dir_patch(&dir_patch_path(ctx.entry, &rel, ctx.repo_root), &new_patch)?;
+            continue;
+        }
+        let canonical_patch = dir_patch_path(ctx.entry, &rel, ctx.repo_root);
+        write_dir_patch(&canonical_patch, &new_patch)?;
+        if patch_file != canonical_patch {
+            std::fs::remove_file(&patch_file)?;
         }
     }
     Ok(())
@@ -146,9 +149,9 @@ fn apply_dir_patches(
 /// the patch captures.
 fn patch_already_covers(patch_text: &str, cache_text: &str, installed_text: &str) -> bool {
     match apply_patch_pure(cache_text, patch_text) {
-        Ok(expected) if installed_text == expected => true, // no new edits
-        Err(_) => true,                                     // cache inconsistent — preserve
-        Ok(_) => false,                                     // additional edits — fall through
+        Ok(expected) if text_content_eq(installed_text, &expected) => true, // no new edits
+        Err(_) => true, // cache inconsistent — preserve
+        Ok(_) => false, // additional edits — fall through
     }
 }
 
@@ -204,7 +207,7 @@ fn representative_single_file_content(
 ) -> Result<Option<String>, SkillfileError> {
     let modified: Vec<&SingleInstalledVariant> = variants
         .iter()
-        .filter(|variant| variant.content != cache_text)
+        .filter(|variant| !text_content_eq(&variant.content, cache_text))
         .collect();
     if modified.is_empty() {
         return Ok(None);
@@ -212,7 +215,7 @@ fn representative_single_file_content(
     let representative = &modified[0].content;
     if modified
         .iter()
-        .any(|variant| variant.content != *representative)
+        .any(|variant| !text_content_eq(&variant.content, representative))
     {
         let labels: Vec<String> = modified
             .iter()
@@ -317,11 +320,7 @@ fn load_cache_files(vdir: &Path) -> BTreeMap<String, PathBuf> {
         .into_iter()
         .filter(|cache_file| cache_file.file_name().is_none_or(|name| name != ".meta"))
         .filter_map(|cache_file| {
-            let filename = cache_file
-                .strip_prefix(vdir)
-                .ok()
-                .and_then(|path| path.to_str())
-                .map(str::to_string)?;
+            let filename = relative_file_key(vdir, &cache_file)?;
             Some((filename, cache_file))
         })
         .collect()
@@ -368,11 +367,20 @@ fn modified_dir_content(
         };
         let cache_text = std::fs::read_to_string(cache_file)?;
         let installed_text = std::fs::read_to_string(installed_path)?;
-        if installed_text != cache_text {
+        if !text_content_eq(&installed_text, &cache_text) {
             modified.insert(filename.clone(), installed_text);
         }
     }
     Ok(modified)
+}
+
+fn dir_modified_content_eq(left: &DirModifiedMap, right: &DirModifiedMap) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(filename, content)| {
+            right
+                .get(filename)
+                .is_some_and(|other| text_content_eq(content, other))
+        })
 }
 
 fn representative_dir_changes(
@@ -393,7 +401,7 @@ fn representative_dir_changes(
     let representative = &modified[0].1;
     if modified
         .iter()
-        .any(|(_, changed)| changed != representative)
+        .any(|(_, changed)| !dir_modified_content_eq(changed, representative))
     {
         let labels: Vec<String> = modified.iter().map(|(label, _)| label.clone()).collect();
         return Err(divergent_auto_pin_error(entry_name, &labels));
@@ -710,10 +718,6 @@ fn restore_path_snapshot(snapshot: &PathSnapshot) -> std::io::Result<()> {
     copy_path(snapshot_path, &snapshot.live_path)
 }
 
-fn forward_slash(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
-}
-
 struct InstallValidationCtx<'a> {
     entry: &'a Entry,
     target: &'a InstallTarget,
@@ -739,9 +743,9 @@ fn flat_expected_paths(source: &Path, target_dir: &Path) -> HashMap<String, Path
         .into_iter()
         .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
         .filter_map(|path| {
-            let rel = path.strip_prefix(source).ok()?;
             let name = path.file_name()?;
-            Some((forward_slash(rel), target_dir.join(name)))
+            let key = relative_file_key(source, &path)?;
+            Some((key, target_dir.join(name)))
         })
         .collect()
 }
@@ -752,7 +756,8 @@ fn nested_expected_paths(source: &Path, dest_root: &Path) -> HashMap<String, Pat
         .filter(|path| path.file_name().is_none_or(|name| name != ".meta"))
         .filter_map(|path| {
             let rel = path.strip_prefix(source).ok()?;
-            Some((forward_slash(rel), dest_root.join(rel)))
+            let key = relative_file_key(source, &path)?;
+            Some((key, dest_root.join(rel)))
         })
         .collect()
 }
@@ -2497,6 +2502,44 @@ mod tests {
     }
 
     #[test]
+    fn auto_pin_comparisons_treat_crlf_as_equivalent() {
+        let patch = "--- a/test.md\n+++ b/test.md\n@@ -1 +1 @@\n-Original\n+Modified\n";
+        assert!(patch_already_covers(patch, "Original\n", "Modified\r\n"));
+
+        let variants = vec![
+            SingleInstalledVariant {
+                label: "claude-code (local)".into(),
+                content: "Modified\n".into(),
+            },
+            SingleInstalledVariant {
+                label: "cursor (local)".into(),
+                content: "Modified\r\n".into(),
+            },
+        ];
+        assert_eq!(
+            representative_single_file_content("test", "Original\n", &variants).unwrap(),
+            Some("Modified\n".into())
+        );
+    }
+
+    #[test]
+    fn auto_pin_preserves_malformed_patch() {
+        assert!(patch_already_covers(
+            "@@ invalid\n",
+            "Original\n",
+            "Modified\n"
+        ));
+    }
+
+    #[test]
+    fn auto_pin_dir_comparison_treats_crlf_as_equivalent() {
+        let left = BTreeMap::from([("SKILL.md".into(), "Modified\n".into())]);
+        let right = BTreeMap::from([("SKILL.md".into(), "Modified\r\n".into())]);
+
+        assert!(dir_modified_content_eq(&left, &right));
+    }
+
+    #[test]
     fn auto_pin_entry_writes_patch_when_installed_differs() {
         let dir = tempfile::tempdir().unwrap();
         let name = "my-skill";
@@ -2782,6 +2825,47 @@ mod tests {
     }
 
     #[test]
+    fn auto_pin_dir_entry_normalizes_cache_file_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "lang-pro";
+
+        let mut locked: BTreeMap<String, LockEntry> = BTreeMap::new();
+        locked.insert(
+            format!("github/skill/{name}"),
+            LockEntry {
+                sha: "deadbeefdeadbeefdeadbeef".into(),
+                raw_url: format!("https://example.com/{name}"),
+            },
+        );
+        write_lock_fixture(dir.path(), &locked);
+
+        let vdir = dir.path().join(format!(".skillfile/cache/skills/{name}"));
+        let cache_file = vdir.join(r"nested\file.md");
+        std::fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
+        std::fs::write(&cache_file, "# Original\n").unwrap();
+
+        let installed_file = dir
+            .path()
+            .join(format!(".claude/skills/{name}/nested/file.md"));
+        std::fs::create_dir_all(installed_file.parent().unwrap()).unwrap();
+        std::fs::write(&installed_file, "# Modified\n").unwrap();
+
+        let entry = make_dir_skill_entry(name);
+        let manifest = Manifest {
+            entries: vec![entry.clone()],
+            install_targets: vec![make_target("claude-code", Scope::Local)],
+        };
+
+        auto_pin_entry(&entry, &manifest, dir.path()).unwrap();
+
+        let patch = dir_patch_fixture_path(dir.path(), &entry, "nested/file.md");
+        assert!(
+            patch.exists(),
+            "auto-pin must match cache and installed files through canonical keys"
+        );
+    }
+
+    #[test]
     fn auto_pin_dir_entry_uses_second_target_when_first_is_clean() {
         let dir = tempfile::tempdir().unwrap();
         let name = "lang-pro";
@@ -3005,6 +3089,59 @@ mod tests {
             expected_rebased_to_new_cache,
             "rebased patch applied to new_cache must reproduce installed_content"
         );
+    }
+
+    #[test]
+    fn apply_dir_patches_normalizes_patch_file_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = make_dir_skill_entry("lang-pro");
+        let patch_text = concat!(
+            "--- a/nested/file.md\n",
+            "+++ b/nested/file.md\n",
+            "@@ -1 +1 @@\n",
+            "-# Original\n",
+            "+# Modified\n",
+        );
+
+        let patches_dir = dir.path().join(".skillfile/patches/skills/lang-pro");
+        let platform_keyed_patch = patches_dir.join(r"nested\file.md.patch");
+        std::fs::create_dir_all(platform_keyed_patch.parent().unwrap()).unwrap();
+        std::fs::write(&platform_keyed_patch, patch_text).unwrap();
+
+        let installed_file = dir.path().join(".claude/skills/lang-pro/nested/file.md");
+        std::fs::create_dir_all(installed_file.parent().unwrap()).unwrap();
+        std::fs::write(&installed_file, "# Original\n").unwrap();
+
+        let source_dir = dir.path().join(".skillfile/cache/skills/lang-pro");
+        let source_file = source_dir.join("nested/file.md");
+        std::fs::create_dir_all(source_file.parent().unwrap()).unwrap();
+        std::fs::write(&source_file, "# Original\n").unwrap();
+
+        let installed_files =
+            HashMap::from([("nested/file.md".to_string(), installed_file.clone())]);
+
+        apply_dir_patches(
+            &PatchCtx {
+                entry: &entry,
+                repo_root: dir.path(),
+            },
+            &installed_files,
+            &source_dir,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&installed_file).unwrap(),
+            "# Modified\n"
+        );
+        let canonical_patch = dir_patch_fixture_path(dir.path(), &entry, "nested/file.md");
+        assert!(canonical_patch.exists());
+        if platform_keyed_patch != canonical_patch {
+            assert!(
+                !platform_keyed_patch.exists(),
+                "rebasing must not leave a second non-canonical patch path"
+            );
+        }
     }
 
     #[test]

@@ -9,14 +9,14 @@ use skillfile_deploy::install::install_entry;
 use skillfile_sources::strategy::{content_file, is_cached_dir_entry};
 use skillfile_sources::sync::vendor_dir_for;
 
-use crate::commands::forward_slash;
 use crate::commands::installed_variants::{installed_dir_variants, installed_single_file_variants};
 use crate::commands::multi_target::{
-    divergent_targets_message, modified_dir_variants, modified_single_file_variants,
+    dir_content_eq, divergent_targets_message, modified_dir_variants, modified_single_file_variants,
 };
 use crate::patch::{
-    dir_patch_path, generate_patch, has_dir_patch, has_patch, remove_all_dir_patches,
-    remove_dir_patch, remove_patch, walkdir, write_dir_patch, write_patch,
+    dir_patch_path, generate_patch, has_dir_patch, has_patch, relative_file_key,
+    remove_all_dir_patches, remove_dir_patch, remove_patch, text_content_eq, walkdir,
+    write_dir_patch, write_patch,
 };
 
 struct PinCtx<'a> {
@@ -68,7 +68,7 @@ fn load_cache_files(vdir: &Path) -> BTreeMap<String, std::path::PathBuf> {
         .into_iter()
         .filter(|cache_file| cache_file.file_name().is_some_and(|name| name != ".meta"))
         .filter_map(|cache_file| {
-            let filename = cache_file.strip_prefix(vdir).ok().map(forward_slash)?;
+            let filename = relative_file_key(vdir, &cache_file)?;
             Some((filename, cache_file))
         })
         .collect()
@@ -82,7 +82,7 @@ fn representative_dir_changes<'a>(
     let representative = &modified[0].1;
     if modified
         .iter()
-        .any(|(_, changed)| changed != representative)
+        .any(|(_, changed)| !dir_content_eq(changed, representative))
     {
         return Err(divergent_targets_message(entry_name, &labels));
     }
@@ -130,7 +130,7 @@ fn pin_single_file_content(
     let representative = &modified[0].content;
     if modified
         .iter()
-        .any(|variant| variant.content != *representative)
+        .any(|variant| !text_content_eq(&variant.content, representative))
     {
         let labels: Vec<String> = modified
             .iter()

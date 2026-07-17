@@ -82,6 +82,7 @@ Explicit path targets install skills as `<path>/<name>/SKILL.md` and agents as `
 ```bash
 skillfile init
 skillfile add
+skillfile list
 skillfile install
 skillfile install --update
 skillfile status

@@ -7,13 +7,12 @@ use skillfile_core::lock::{lock_key, read_lock};
 use skillfile_core::models::{short_sha, EntityType, Entry, LockEntry, Manifest, SourceFields};
 use skillfile_core::parser::MANIFEST_NAME;
 use skillfile_core::patch::{
-    apply_patch_pure, dir_patch_path, has_dir_patch, has_patch, read_patch, walkdir,
+    apply_patch_pure, dir_patch_path, has_dir_patch, has_patch, read_patch, relative_file_key,
+    text_content_eq, walkdir,
 };
 use skillfile_deploy::paths::{installed_dir_file_sets, installed_paths};
 use skillfile_sources::strategy::{content_file, is_cached_dir_entry, meta_sha};
 use skillfile_sources::sync::vendor_dir_for;
-
-use crate::commands::forward_slash;
 
 struct DirCheckCtx<'a> {
     entry: &'a Entry,
@@ -23,7 +22,7 @@ struct DirCheckCtx<'a> {
 }
 
 fn is_cache_file_modified(cache_file: &Path, ctx: &DirCheckCtx<'_>) -> Result<bool, ()> {
-    let filename = forward_slash(cache_file.strip_prefix(ctx.vdir).map_err(|_| ())?);
+    let filename = relative_file_key(ctx.vdir, cache_file).ok_or(())?;
     let inst_path = match ctx.installed.get(&filename) {
         Some(p) if p.exists() => p,
         _ => return Ok(false),
@@ -31,7 +30,7 @@ fn is_cache_file_modified(cache_file: &Path, ctx: &DirCheckCtx<'_>) -> Result<bo
     let cache_text = std::fs::read_to_string(cache_file).map_err(|_| ())?;
     let expected_text = expected_dir_file_text(&filename, &cache_text, ctx)?;
     let installed_text = std::fs::read_to_string(inst_path).map_err(|_| ())?;
-    Ok(installed_text != expected_text)
+    Ok(!text_content_eq(&installed_text, &expected_text))
 }
 
 fn check_dir_files_modified(
@@ -110,7 +109,7 @@ fn check_single_file_modified(
             continue;
         }
         let installed_text = std::fs::read_to_string(&installed_path).map_err(|_| ())?;
-        if installed_text != expected_text {
+        if !text_content_eq(&installed_text, &expected_text) {
             return Ok(true);
         }
     }

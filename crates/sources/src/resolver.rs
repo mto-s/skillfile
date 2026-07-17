@@ -281,9 +281,10 @@ pub fn fetch_github_file(
     } else {
         path_in_repo
     };
+    let encoded_path = encode_url_path(effective_path);
     let url = format!(
         "https://raw.githubusercontent.com/{}/{}/{}",
-        gh.owner_repo, gh.ref_, effective_path
+        gh.owner_repo, gh.ref_, encoded_path
     );
     http_get(gh.client, &url)
 }
@@ -1438,6 +1439,56 @@ mod tests {
         };
         let result = fetch_github_file(&gh, ".").unwrap();
         assert_eq!(result, b"# Root skill");
+    }
+
+    #[test]
+    fn fetch_github_file_encodes_space_in_path() {
+        let sha = "abc123";
+        let url = format!("https://raw.githubusercontent.com/org/repo/{sha}/skills/my%20skill.md");
+        let mut client = MockClient::new();
+        client.add_bytes(&url, b"# Skill with space".to_vec());
+
+        let gh = GithubFetch {
+            client: &client,
+            owner_repo: "org/repo",
+            ref_: sha,
+        };
+        let result = fetch_github_file(&gh, "skills/my skill.md").unwrap();
+        assert_eq!(result, b"# Skill with space");
+    }
+
+    #[test]
+    fn fetch_github_file_encodes_hash_in_path() {
+        let sha = "abc123";
+        let url = format!("https://raw.githubusercontent.com/org/repo/{sha}/skills/my%23skill.md");
+        let mut client = MockClient::new();
+        client.add_bytes(&url, b"# Skill with hash".to_vec());
+
+        let gh = GithubFetch {
+            client: &client,
+            owner_repo: "org/repo",
+            ref_: sha,
+        };
+        let result = fetch_github_file(&gh, "skills/my#skill.md").unwrap();
+        assert_eq!(result, b"# Skill with hash");
+    }
+
+    #[test]
+    fn fetch_github_file_encodes_unicode_in_path() {
+        let sha = "abc123";
+        let url = format!(
+            "https://raw.githubusercontent.com/org/repo/{sha}/skills/%E6%8C%89%E9%92%AE.md"
+        );
+        let mut client = MockClient::new();
+        client.add_bytes(&url, b"# Unicode skill".to_vec());
+
+        let gh = GithubFetch {
+            client: &client,
+            owner_repo: "org/repo",
+            ref_: sha,
+        };
+        let result = fetch_github_file(&gh, "skills/按钮.md").unwrap();
+        assert_eq!(result, b"# Unicode skill");
     }
 
     #[test]
@@ -2873,5 +2924,16 @@ mod tests {
         assert!(entries
             .iter()
             .any(|entry| entry.relative_path == "final.md"));
+    }
+    #[test]
+    fn test_encode_url_path_with_space() {
+        let result = encode_url_path("my skill.md");
+        assert_eq!(result, "my%20skill.md");
+    }
+
+    #[test]
+    fn test_encode_url_path_with_hash() {
+        let result = encode_url_path("my#skill.md");
+        assert_eq!(result, "my%23skill.md");
     }
 }

@@ -407,6 +407,47 @@ mod tests {
     }
 
     #[test]
+    fn cmd_format_preserves_quoted_local_path() {
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(
+            dir.path(),
+            "local  skill  commit  \"my skills/git commit.md\"\n",
+        );
+
+        cmd_format(dir.path(), false).unwrap();
+
+        let text = std::fs::read_to_string(dir.path().join(MANIFEST_NAME)).unwrap();
+        assert!(text.contains("local  skill  commit  'my skills/git commit.md'"));
+    }
+
+    #[test]
+    fn cmd_format_round_trips_shell_sensitive_local_paths() {
+        for (name, quoted_path, expected_path) in [
+            ("windows", r"'C:\skills\win.md'", r"C:\skills\win.md"),
+            ("single-quote", r#""skills/it's.md""#, "skills/it's.md"),
+            (
+                "double-quote",
+                r#"'skills/"quoted".md'"#,
+                r#"skills/"quoted".md"#,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            write_manifest(
+                dir.path(),
+                &format!("local  skill  {name}  {quoted_path}\n"),
+            );
+
+            cmd_format(dir.path(), false).unwrap();
+
+            let result = parse_manifest(&dir.path().join(MANIFEST_NAME)).unwrap();
+            assert_eq!(
+                result.manifest.entries[0].source.as_local(),
+                Some(expected_path)
+            );
+        }
+    }
+
+    #[test]
     fn cmd_format_dry_run_does_not_write() {
         let dir = tempfile::tempdir().unwrap();
         let original = "github  skill  z/repo  z.md\ngithub  skill  a/repo  a.md\n";

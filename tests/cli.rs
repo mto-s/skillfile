@@ -179,6 +179,97 @@ fn validate_golden_path() {
 }
 
 #[test]
+fn list_groups_entries_by_entity_type() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Skillfile"),
+        "install  claude-code  local\n\
+         github  skill  browser  anthropics/skills  skills/browser/SKILL.md  main\n\
+         local  skill  commit  skills/commit.md\n\
+         github  agent  reviewer  anthropics/skills  agents/reviewer.md  v1\n",
+    )
+    .unwrap();
+
+    let output = sf(dir.path()).arg("list").output().unwrap();
+    let stdout = normalize_separators(std::str::from_utf8(&output.stdout).unwrap());
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+
+    assert!(output.status.success(), "list should succeed: {stderr}");
+    assert_grouped_list_output(&stdout);
+}
+
+fn assert_grouped_list_output(stdout: &str) {
+    assert!(
+        stdout.contains("Skills (2):"),
+        "missing skills group:\n{stdout}"
+    );
+    for expected in [
+        "browser",
+        "github",
+        "anthropics/skills:skills/browser/SKILL.md",
+        "commit",
+        "local",
+        "skills/commit.md",
+        "reviewer",
+        "v1",
+        "Install targets: claude-code (local)",
+    ] {
+        assert!(stdout.contains(expected), "missing {expected:?}:\n{stdout}");
+    }
+    assert!(
+        stdout.contains("Agents (1):"),
+        "missing agents group:\n{stdout}"
+    );
+}
+
+#[test]
+fn list_names_only_filters_skills() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Skillfile"),
+        "local  skill  browser  skills/browser.md\n\
+         local  agent  reviewer  agents/reviewer.md\n",
+    )
+    .unwrap();
+
+    let output = sf(dir.path())
+        .args(["list", "--names-only", "--skills"])
+        .output()
+        .unwrap();
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+
+    assert!(output.status.success(), "list should succeed: {stderr}");
+    assert_eq!(stdout, "browser\n");
+}
+
+#[test]
+fn list_json_outputs_entries_and_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Skillfile"),
+        "install  codex  global\n\
+         url  skill  rust-dev  https://example.com/rust.md\n",
+    )
+    .unwrap();
+
+    let output = sf(dir.path()).args(["list", "--json"]).output().unwrap();
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+
+    assert!(output.status.success(), "list should succeed: {stderr}");
+    let json: serde_json::Value = serde_json::from_str(stdout).unwrap();
+    assert_eq!(json["entries"][0]["name"], "rust-dev");
+    assert_eq!(json["entries"][0]["entity_type"], "skill");
+    assert_eq!(json["entries"][0]["source_type"], "url");
+    assert_eq!(
+        json["entries"][0]["location"],
+        "https://example.com/rust.md"
+    );
+    assert_eq!(json["install_targets"][0], "codex (global)");
+}
+
+#[test]
 fn validate_junie_platform() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -334,9 +425,64 @@ fn format_golden_path() {
     assert!(entry_lines[1].contains("zebra"), "zebra should be second");
 }
 
+#[test]
+fn format_keeps_spaced_local_path_valid() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("my skills")).unwrap();
+    std::fs::write(
+        dir.path().join("my skills/git commit.md"),
+        "# Commit skill\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("Skillfile"),
+        "local  skill  commit  \"my skills/git commit.md\"\n",
+    )
+    .unwrap();
+
+    sf(dir.path()).arg("validate").assert().success();
+    sf(dir.path()).arg("format").assert().success();
+    sf(dir.path()).arg("validate").assert().success();
+
+    let text = std::fs::read_to_string(dir.path().join("Skillfile")).unwrap();
+    assert!(text.contains("local  skill  commit  'my skills/git commit.md'"));
+}
+
 // ---------------------------------------------------------------------------
 // add, remove
 // ---------------------------------------------------------------------------
+
+#[test]
+fn add_keeps_spaced_local_path_valid() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("my skills")).unwrap();
+    std::fs::write(
+        dir.path().join("my skills/git commit.md"),
+        "# Commit skill\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("Skillfile"), "# empty\n").unwrap();
+
+    sf(dir.path())
+        .env(
+            "SKILLFILE_CONFIG_PATH",
+            dir.path().join("missing-config.toml"),
+        )
+        .args([
+            "add",
+            "local",
+            "skill",
+            "my skills/git commit.md",
+            "--name",
+            "commit",
+        ])
+        .assert()
+        .success();
+    sf(dir.path()).arg("validate").assert().success();
+
+    let text = std::fs::read_to_string(dir.path().join("Skillfile")).unwrap();
+    assert!(text.contains("local  skill  commit  'my skills/git commit.md'"));
+}
 
 #[test]
 fn add_then_remove() {
@@ -554,6 +700,35 @@ fn assert_info_lock_pin_cache_output(stdout: &str) {
         modified_line.trim_end().ends_with("no"),
         "pinned fixture should report modified=no:\n{stdout}"
     );
+}
+
+#[test]
+fn pin_status_preserves_installed_line_endings() {
+    for (name, installed_text) in [
+        ("no-final-newline", "# Skill\n\nPinned without newline."),
+        ("crlf", "# Skill\r\n\r\nPinned with CRLF.\r\n"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        write_remote_skill_fixture(
+            dir.path(),
+            &RemoteSkillFixture {
+                name,
+                installed_text: Some(installed_text),
+                patch_text: None,
+            },
+        );
+
+        sf(dir.path()).args(["pin", name]).assert().success();
+
+        let output = sf(dir.path()).arg("status").output().unwrap();
+        let stdout = std::str::from_utf8(&output.stdout).unwrap();
+        let entry_line = output_line(stdout, name);
+        assert!(output.status.success(), "status failed:\n{stdout}");
+        assert!(
+            !entry_line.contains("[modified]"),
+            "freshly pinned entry must be clean:\n{stdout}"
+        );
+    }
 }
 
 #[test]
