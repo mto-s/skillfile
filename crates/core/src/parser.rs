@@ -80,7 +80,11 @@ pub fn resolve_explicit_owner_repo_ref(
     at_ref: Option<String>,
     positional_ref: Option<&str>,
 ) -> Option<String> {
-    at_ref.or_else(|| positional_ref.map(String::from))
+    at_ref.filter(|ref_| !ref_.trim().is_empty()).or_else(|| {
+        positional_ref
+            .filter(|ref_| !ref_.trim().is_empty())
+            .map(String::from)
+    })
 }
 
 /// Resolve the effective ref from the `@`-syntax parsed ref and an explicit positional ref.
@@ -106,6 +110,17 @@ fn parse_github_owner_repo(
          — expected 'owner/repo' or 'owner/repo@ref' format"
     ));
     None
+}
+
+fn validate_repo_path(path: &str, source_type: &str, lineno: usize) -> Result<(), String> {
+    let path = path.trim();
+    if path == "." || Path::new(path).file_name().is_some() {
+        return Ok(());
+    }
+    Err(format!(
+        "warning: line {lineno}: {source_type} entry has invalid repository path '{path}' \
+         — expected a non-root path or '.'"
+    ))
 }
 
 /// Parse a github entry line. parts[0]=source_type, parts[1]=entity_type, etc.
@@ -147,6 +162,11 @@ fn parse_github_entry(
         (parts[2].clone(), parsed_repo, &parts[4], ref_)
     };
 
+    if let Err(warning) = validate_repo_path(path_in_repo, "github", lineno) {
+        warnings.push(warning);
+        return (None, warnings);
+    }
+
     let entry = Entry {
         entity_type,
         name,
@@ -174,7 +194,7 @@ fn parse_gitlab_entry(
             ));
             return (None, warnings);
         }
-        let ref_ = parts.get(4).map_or(DEFAULT_REF, String::as_str);
+        let ref_ = resolve_owner_repo_ref(None, parts.get(4).map(String::as_str));
         (infer_name(&parts[3]), &parts[2], &parts[3], ref_)
     } else {
         if parts.len() < 5 {
@@ -191,9 +211,14 @@ fn parse_gitlab_entry(
             ));
             return (None, warnings);
         }
-        let ref_ = parts.get(5).map_or(DEFAULT_REF, String::as_str);
+        let ref_ = resolve_owner_repo_ref(None, parts.get(5).map(String::as_str));
         (parts[2].clone(), &parts[3], &parts[4], ref_)
     };
+
+    if let Err(warning) = validate_repo_path(path_in_repo, "gitlab", lineno) {
+        warnings.push(warning);
+        return (None, warnings);
+    }
 
     let entry = Entry {
         entity_type,
@@ -201,7 +226,7 @@ fn parse_gitlab_entry(
         source: SourceFields::Gitlab {
             owner_repo: owner_repo.clone(),
             path_in_repo: path_in_repo.clone(),
-            ref_: ref_.to_owned(),
+            ref_,
         },
     };
     (Some(entry), warnings)
@@ -540,6 +565,60 @@ mod tests {
         p
     }
 
+    fn assert_repo_path_rejected(source_type: &str, path: &str) {
+        for line in [
+            format!("{source_type}  skill  owner/repo  {path}"),
+            format!("{source_type}  skill  named  owner/repo  {path}"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = write_manifest(dir.path(), &line);
+            let r = parse_manifest(&p).unwrap();
+            assert!(r.manifest.entries.is_empty(), "accepted: {line}");
+            assert!(
+                r.warnings.iter().any(|warning| warning
+                    .contains(&format!("{source_type} entry has invalid repository path"))),
+                "missing warning for: {line}"
+            );
+        }
+    }
+
+    fn assert_dot_repo_path_preserved(source_type: &str) {
+        for line in [
+            format!("{source_type}  skill  owner/repo  ."),
+            format!("{source_type}  skill  named  owner/repo  ."),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = write_manifest(dir.path(), &line);
+            let r = parse_manifest(&p).unwrap();
+            assert_eq!(r.manifest.entries.len(), 1, "rejected: {line}");
+            assert!(matches!(
+                &r.manifest.entries[0].source,
+                SourceFields::Github { path_in_repo, .. }
+                    | SourceFields::Gitlab { path_in_repo, .. }
+                    if path_in_repo == "."
+            ));
+        }
+    }
+
+    fn assert_empty_repo_ref_defaults_to_main(source_type: &str) {
+        for line in [
+            format!("{source_type}  skill  owner/repo  path  \"\""),
+            format!("{source_type}  skill  named  owner/repo  path  \"\""),
+            format!("{source_type}  skill  owner/repo  path  \"   \""),
+            format!("{source_type}  skill  named  owner/repo  path  \"   \""),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let p = write_manifest(dir.path(), &line);
+            let r = parse_manifest(&p).unwrap();
+            assert_eq!(r.manifest.entries.len(), 1, "rejected: {line}");
+            assert!(matches!(
+                &r.manifest.entries[0].source,
+                SourceFields::Github { ref_, .. } | SourceFields::Gitlab { ref_, .. }
+                    if ref_ == DEFAULT_REF
+            ));
+        }
+    }
+
     // -------------------------------------------------------------------
     // Existing entry types (explicit name + ref)
     // -------------------------------------------------------------------
@@ -680,6 +759,38 @@ mod tests {
         );
         let r = parse_manifest(&p).unwrap();
         assert_eq!(r.manifest.entries[0].ref_(), "main");
+    }
+
+    #[test]
+    fn repository_sources_reject_empty_and_root_only_paths() {
+        for (source_type, path) in [
+            ("github", "\"\""),
+            ("github", "\"   \""),
+            ("github", "/"),
+            ("github", "//"),
+            ("github", "/./"),
+            ("gitlab", "\"\""),
+            ("gitlab", "\"   \""),
+            ("gitlab", "/"),
+            ("gitlab", "//"),
+            ("gitlab", "/./"),
+        ] {
+            assert_repo_path_rejected(source_type, path);
+        }
+    }
+
+    #[test]
+    fn repository_sources_preserve_dot_root_path() {
+        for source_type in ["github", "gitlab"] {
+            assert_dot_repo_path_preserved(source_type);
+        }
+    }
+
+    #[test]
+    fn repository_sources_default_empty_refs() {
+        for source_type in ["github", "gitlab"] {
+            assert_empty_repo_ref_defaults_to_main(source_type);
+        }
     }
 
     // -------------------------------------------------------------------
