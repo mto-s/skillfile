@@ -6,9 +6,15 @@ All notable changes to skillfile are documented here.
 
 ## Unreleased
 
+## v1.9.0 - 21-07-2026
+
 ### Added
 
-- **Explicit install path targets** - deploy skills and agents to custom local or global directories using `install-path`, with support for formatting, validation, status, diff, pin, and unpin by @mto-s
+- **Custom install paths** - deploy skills and agents to any filesystem directory with `install-path`, including AI tools without a built-in target by @mto-s
+
+### Changed
+
+- **Dependency refresh** - bumped `serde_json` to 1.0.151 and `thiserror` to 2.0.19.
 
 ### Fixed
 

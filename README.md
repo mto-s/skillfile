@@ -10,7 +10,7 @@
 
 **One AI setup, everywhere. Pin it. Patch it. Deploy everywhere.**
 
-Use the same skills and agents on your work laptop, personal machine, servers, and whichever AI tools you use. Put the setup in a repo when you want to share it with a team. skillfile locks upstream versions, preserves your edits on update, and installs to Claude Code, Codex, Cursor, Antigravity, and more. No runtime or framework required.
+Use the same skills and agents on your work laptop, personal machine, servers, and whichever AI tools you use. Put the setup in a repo when you want to share it with a team. skillfile locks upstream versions, preserves your edits on update, and installs to Claude Code, Codex, Cursor, Antigravity, custom filesystem paths, and more. No runtime or framework required.
 
 ![demo](https://github.com/eljulians/skillfile/raw/master/docs/demo.gif)
 
@@ -94,6 +94,11 @@ Entities:
 - `skill`
 - `agent`
 
+Install targets:
+
+- Built-in AI tool directories with `install`
+- Any filesystem directory with `install-path`
+
 GitLab project paths may include subgroups. Self-hosted GitLab is supported through `GITLAB_HOST`.
 
 ## Example Skillfile
@@ -101,12 +106,15 @@ GitLab project paths may include subgroups. Self-hosted GitLab is supported thro
 ```text
 install  claude-code  global
 install  codex        global
+install-path  openclaw  skill  ~/.openclaw/skills
 
 github  skill  anthropics/skills  skills/slack-gif-creator
 gitlab  skill  my-group/platform-skills  skills/release
 local   skill  skills/team/reviewer/SKILL.md
 url     agent  triager  https://example.com/agents/triager.md
 ```
+
+The `install-path` line sends all three skill entries above to `~/.openclaw/skills` in addition to the compatible built-in targets. `openclaw` is only the target's display label. See [Custom install paths](#custom-install-paths) for layouts and a complete example.
 
 Format details live in [SPEC.md](SPEC.md).
 
@@ -164,6 +172,43 @@ Supported install targets:
 - `antigravity`
 
 Some platforms support skills only; see `skillfile init` or `skillfile --help` for the exact target behavior.
+
+### Custom install paths
+
+Use `install-path <label> <entity-type> <directory>` when a tool is not built in or reads skills or agents from a nonstandard directory. This creates an install target; it does not add a skill or agent by itself.
+
+For example, this `Skillfile` declares one custom skill target and two skills:
+
+```text
+install-path  openclaw  skill  ~/.openclaw/skills
+
+github  skill  reviewer       acme/skills  reviewer/SKILL.md
+local   skill  release-notes  skills/release-notes/SKILL.md
+```
+
+Running `skillfile install` installs both skill entries into the target:
+
+```text
+~/.openclaw/skills/reviewer/SKILL.md
+~/.openclaw/skills/release-notes/SKILL.md
+```
+
+In other words, every entry matching the target's entity type is installed there. If the `Skillfile` also contained agents, they would not be installed into this skill-only target. Add another target for them:
+
+```text
+install-path  openclaw-agents  agent  ~/.openclaw/agents
+```
+
+The label (`openclaw` or `openclaw-agents` above) is only a name shown in command output. It does not enable an OpenClaw integration or choose which entries to install. Each target uses these layouts:
+
+| Entity | Installed layout |
+|---|---|
+| `skill` | `<path>/<name>/SKILL.md` for a single-file skill, or `<path>/<name>/...` for a directory skill |
+| `agent` | `<path>/<name>.md` |
+
+Relative paths are resolved from the repository root. `~` and paths beginning with `~/` use your home directory. Custom targets can be mixed with built-in `install` targets; matching entries are installed to every configured target that supports their entity type.
+
+`skillfile validate` rejects duplicate destinations for the same entity type. Install and read operations also refuse to traverse user-controlled symlinked path components so a declared target cannot escape through a symlink.
 
 ## Notes
 
